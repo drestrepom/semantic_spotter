@@ -1,0 +1,37 @@
+[project]
+name = "semantic-spotter"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Diego Restrepo", email = "restrepomesadiego@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "lancedb>=0.41.0",
+    "numpy>=2.5.4",
+    "pyarrow>=26.0.1",
+    "python-dotenv>=1.2.4",
+    "rich>=15.0.0",
+    "tree-sitter>=0.26.1",
+    "tree-sitter-go>=0.25.0",
+    "tree-sitter-typescript>=0.23.2",
+    "typer>=0.29.0",
+    "voyageai>=0.5.0",
+]
+
+[project.scripts]
+semantic-spotter = "semantic_spotter:main"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
