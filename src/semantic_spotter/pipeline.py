@@ -228,9 +228,7 @@ async def plan_embeddings(
     occurrence: dict[str, Snippet] = {}
     for s in snippets:
         occurrence.setdefault(s.content_hash, s)
-    if missing is None:
-        missing = await store.missing_hashes(list(occurrence))
-    missing = list(missing)
+    missing = list(missing) if missing is not None else await store.missing_hashes(list(occurrence))
     if not missing:
         return EmbeddingPlan([], [], [])
     sources = await gitsource.read_blobs(repo, sorted({occurrence[h].blob_oid for h in missing}))
