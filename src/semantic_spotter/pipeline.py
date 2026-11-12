@@ -213,16 +213,20 @@ async def plan_embeddings(
     repo: Path,
     snippets: Sequence[Snippet],
     embedder_factory: Callable[[], Embedder],
+    missing: Sequence[str] | None = None,
 ) -> EmbeddingPlan:
     """Hashes que todavía no tienen embedding en caché, con su texto leído de git.
 
-    El embedder solo se construye si falta algo, así un re-escaneo sin cambios
-    no necesita API key ni descarga el tokenizer.
+    `missing` evita volver a consultarlos si quien llama ya lo hizo. El embedder
+    solo se construye si falta algo, así un re-escaneo sin cambios no necesita
+    API key ni descarga el tokenizer.
     """
     occurrence: dict[str, Snippet] = {}
     for s in snippets:
         occurrence.setdefault(s.content_hash, s)
-    missing = await store.missing_hashes(list(occurrence))
+    if missing is None:
+        missing = await store.missing_hashes(list(occurrence))
+    missing = list(missing)
     if not missing:
         return EmbeddingPlan([], [], [])
     sources = await gitsource.read_blobs(repo, sorted({occurrence[h].blob_oid for h in missing}))

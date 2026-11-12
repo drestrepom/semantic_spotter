@@ -515,17 +515,21 @@ class Store:
 
     # --- embeddings -----------------------------------------------------------
 
-    async def _cached_hashes(self) -> set[str]:
-        table = await self._embeddings.query().select(["content_hash"]).to_arrow()
-        return set(table.column("content_hash").to_pylist())
+    async def _cached_hashes(self, hashes: Iterable[str]) -> set[str]:
+        """Los de `hashes` que ya tienen embedding."""
+        cached: set[str] = set()
+        for chunk in _chunks(sorted(set(hashes))):
+            rows = await self._rows(self._embeddings, _in("content_hash", chunk), ["content_hash"])
+            cached.update(r["content_hash"] for r in rows)
+        return cached
 
     async def missing_hashes(self, hashes: Sequence[str]) -> list[str]:
-        cached = await self._cached_hashes()
+        cached = await self._cached_hashes(hashes)
         return [h for h in dict.fromkeys(hashes) if h not in cached]
 
     async def add_embeddings(self, hashes: Sequence[str], vectors: np.ndarray) -> None:
         # Otro proceso pudo haber guardado algunos mientras se embebían.
-        cached = await self._cached_hashes()
+        cached = await self._cached_hashes(hashes)
         keep = [i for i, h in enumerate(hashes) if h not in cached]
         if not keep:
             return
@@ -541,12 +545,21 @@ class Store:
 
     async def load_vectors(self, hashes: Sequence[str]) -> np.ndarray:
         """Matriz alineada con `hashes`; falla si alguno no está en caché."""
-        table = await self._embeddings.to_arrow()
-        index = {h: i for i, h in enumerate(table.column("content_hash").to_pylist())}
-        all_vectors = (
-            table.column("vector").combine_chunks().flatten().to_numpy().reshape(-1, self.dim)
-        )
+        index: dict[str, np.ndarray] = {}
+        for chunk in _chunks(sorted(set(hashes))):
+            table = (
+                await self._embeddings.query()
+                .where(_in("content_hash", chunk))
+                .select(["content_hash", "vector"])
+                .to_arrow()
+            )
+            vectors = (
+                table.column("vector").combine_chunks().flatten().to_numpy().reshape(-1, self.dim)
+            )
+            index.update(zip(table.column("content_hash").to_pylist(), vectors))
         missing = [h for h in hashes if h not in index]
         if missing:
             raise KeyError(f"{len(missing)} embeddings faltantes en caché")
-        return all_vectors[[index[h] for h in hashes]]
+        if not hashes:
+            return np.empty((0, self.dim), dtype=np.float32)
+        return np.stack([index[h] for h in hashes])

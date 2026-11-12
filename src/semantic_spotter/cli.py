@@ -156,6 +156,7 @@ async def _ensure_embeddings(
     settings: EmbedSettings,
     *,
     dry_run: bool = False,
+    missing: Sequence[str] | None = None,
 ) -> bool:
     """Embebe los hashes que faltan; False si es `dry_run` y no se embebió."""
     embedder: Embedder | None = None
@@ -167,7 +168,7 @@ async def _ensure_embeddings(
         return embedder
 
     with err.status("Contando tokens de snippets nuevos…"):
-        plan = await plan_embeddings(store, repo, snippets, get_embedder)
+        plan = await plan_embeddings(store, repo, snippets, get_embedder, missing)
     err.print(f"{len(plan.hashes)} snippets sin embedding · ~{plan.total_tokens:,} tokens")
     if dry_run:
         return False
@@ -464,7 +465,7 @@ async def _check(
         if missing and _api_key() is None:
             err.print("[yellow]Sin VOYAGE_API_KEY: se omiten los clones semánticos (T4).[/]")
         else:
-            await _ensure_embeddings(store, repo, snippets, embed)
+            await _ensure_embeddings(store, repo, snippets, embed, missing=missing)
             matrix = await store.load_vectors([s.content_hash for s in snippets])
 
     pairs = structural_pairs(snippets, queries, matrix, t3_jaccard=t3_jaccard)
