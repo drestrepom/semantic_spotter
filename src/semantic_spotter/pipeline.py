@@ -64,7 +64,8 @@ async def tree_files(store: Store, repo: Path, tree_oid: str) -> list[TreeFile]:
         for f in await gitsource.list_files(repo, tree_oid)
         if (spec := spec_for(f.path)) and gitsource.is_candidate(f.path, include_tests=True)
     ]
-    await store.save_tree(tree_oid, files)
+    async with store.writing():
+        await store.save_tree(tree_oid, files)
     return files
 
 
@@ -99,7 +100,8 @@ async def index_commit(
 ) -> list[Snippet]:
     """Registra que el commit se analizó y devuelve los snippets de su árbol."""
     tree_oid = await gitsource.tree_of(repo, sha)
-    await store.link_commit(sha, tree_oid)
+    async with store.writing():
+        await store.link_commit(sha, tree_oid)
     return await index_tree(store, repo, tree_oid, options)
 
 
@@ -170,7 +172,10 @@ async def index_history(
                     if (f.path, h) not in seen:
                         seen.add((f.path, h))
                         sightings.append(Sighting(f.path, h, c.sha, c.committed_at))
-        await store.save_history(options.key, [(c.sha, c.committed_at) for c in batch], sightings)
+        async with store.writing():
+            await store.save_history(
+                options.key, [(c.sha, c.committed_at) for c in batch], sightings
+            )
         sightings_total += len(sightings)
         if on_batch is not None:
             on_batch(start + len(batch), len(todo))
@@ -300,7 +305,8 @@ async def run_embeddings(
         for done in asyncio.as_completed(tasks):
             batch, vectors = await done
             # Las escrituras se serializan aquí; lo ya persistido sobrevive a un fallo.
-            await store.add_embeddings([plan.hashes[i] for i in batch], vectors)
+            async with store.writing():
+                await store.add_embeddings([plan.hashes[i] for i in batch], vectors)
             if on_batch is not None:
                 on_batch(len(batch))
     finally:

@@ -4,13 +4,12 @@ import itertools
 import os
 import re
 from collections import defaultdict
-import functools
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Concatenate, Self
+from typing import Any, Self
 
 import lancedb
 import numpy as np
@@ -143,19 +142,6 @@ async def _flock(lock_path: Path) -> AsyncIterator[None]:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def _locked[**P, R](
-    method: Callable[Concatenate["Store", P], Awaitable[R]],
-) -> Callable[Concatenate["Store", P], Awaitable[R]]:
-    """La escritura completa corre con el lock del índice tomado."""
-
-    @functools.wraps(method)
-    async def wrapper(self: "Store", *args: P.args, **kwargs: P.kwargs) -> R:
-        async with self.writing():
-            return await method(self, *args, **kwargs)
-
-    return wrapper
-
-
 @dataclass(frozen=True, slots=True)
 class Sighting:
     """Dónde y cuándo se vio por primera vez un (ruta, contenido)."""
@@ -203,7 +189,6 @@ class Store:
     ) -> None:
         self._db = db
         self._lock_path = lock_path
-        self._writer: asyncio.Task[Any] | None = None
         self._commits = tables["commits"]
         self._trees = tables["trees"]
         self._tree_files = tables["tree_files"]
@@ -251,20 +236,13 @@ class Store:
     async def writing(self) -> AsyncIterator[None]:
         """Lock exclusivo de escritura sobre el índice, compartido entre procesos.
 
-        Usa `flock` sobre un archivo del índice. Es reentrante dentro de la misma
-        tarea, así que una operación compuesta (re-consultar y guardar) puede
-        envolver escrituras que también lo toman. Las lecturas no lo necesitan.
+        Toda escritura (`save_*`, `add_embeddings`) corre dentro de un `writing()`
+        explícito; esos métodos no toman el lock, y `writing()` no es reentrante.
+        Cada uno vuelve a consultar, ya con el lock, qué falta escribir. Las
+        lecturas no lo necesitan.
         """
-        task = asyncio.current_task()
-        if task is not None and self._writer is task:
-            yield
-            return
         async with _flock(self._lock_path):
-            self._writer = task
-            try:
-                yield
-            finally:
-                self._writer = None
+            yield
 
     async def _rows(
         self, table: AsyncTable, where: str, columns: Sequence[str] | None = None
@@ -276,7 +254,6 @@ class Store:
 
     # --- commits y árboles ----------------------------------------------------
 
-    @_locked
     async def link_commit(self, sha: str, tree_oid: str) -> None:
         if await self._commits.count_rows(f"commit_sha = {_sql_str(sha)}"):
             return
@@ -289,7 +266,6 @@ class Store:
     async def has_tree(self, tree_oid: str) -> bool:
         return await self._trees.count_rows(f"tree_oid = {_sql_str(tree_oid)}") > 0
 
-    @_locked
     async def save_tree(self, tree_oid: str, files: Sequence[TreeFile]) -> None:
         if await self.has_tree(tree_oid):
             return  # otro proceso lo registró mientras esperábamos el lock
@@ -330,7 +306,6 @@ class Store:
             done.update((r["blob_oid"], r["language"]) for r in rows)
         return wanted - done
 
-    @_locked
     async def save_blobs(
         self, extract_key: str, normalizer: str, blobs: Sequence[ExtractedBlob]
     ) -> None:
@@ -443,7 +418,6 @@ class Store:
         )
         return {(r["path"], r["content_hash"]) for r in rows}
 
-    @_locked
     async def save_history(
         self,
         extract_key: str,
@@ -499,7 +473,6 @@ class Store:
         cached = await self._cached_hashes()
         return [h for h in dict.fromkeys(hashes) if h not in cached]
 
-    @_locked
     async def add_embeddings(self, hashes: Sequence[str], vectors: np.ndarray) -> None:
         # Otro proceso pudo haber guardado algunos mientras se embebían.
         cached = await self._cached_hashes()
