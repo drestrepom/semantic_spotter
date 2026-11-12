@@ -492,6 +492,18 @@ def test_index_path_from_env(check_repo, tmp_path, monkeypatch):
     assert sorted(extracted) == ["a/a.go", "c/c.go"]
 
 
+def test_relative_index_path_is_inside_repo_and_ignored(check_repo, tmp_path, monkeypatch):
+    elsewhere = tmp_path / "otro"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setenv("SEMANTIC_SPOTTER_DB", "indice")
+    assert _check(check_repo, "--structural").exit_code == 0
+    assert (check_repo / "indice").is_dir()
+    assert not (elsewhere / "indice").exists()
+    # Un índice dentro del worktree no ensucia `git status`.
+    assert git(check_repo, "status", "--porcelain") == ""
+
+
 async def test_check_gives_up_on_held_lock(check_repo, monkeypatch):
     monkeypatch.setattr(store, "_LOCK_WARN_SECONDS", 0.05)
     monkeypatch.setattr(store, "_LOCK_TIMEOUT_SECONDS", 0.5)

@@ -186,10 +186,11 @@ async def index_dir(repo_root: Path) -> Path:
     """`$SEMANTIC_SPOTTER_DB` o `<directorio común de git>/semantic-spotter/`.
 
     El directorio común es el mismo para todos los worktrees, así que un
-    worktree nuevo encuentra ya extraído lo que extrajeron los demás.
+    worktree nuevo encuentra ya extraído lo que extrajeron los demás. Una ruta
+    relativa en la variable se resuelve contra el repo, no contra el cwd.
     """
     if override := os.environ.get(DB_ENV):
-        return Path(override)
+        return repo_root / override
     return await gitsource.common_dir(repo_root) / DB_DIRNAME
 
 
@@ -238,6 +239,10 @@ class Store:
         """Abre (o crea) el índice; `on_lock_wait` se llama si el lock tarda en llegar."""
         path = await index_dir(repo_root)
         path.mkdir(parents=True, exist_ok=True)
+        # Por si el índice queda dentro de un worktree (p. ej. con `SEMANTIC_SPOTTER_DB`).
+        gitignore = path / ".gitignore"
+        if not gitignore.exists():
+            gitignore.write_text("*\n")
         # Consistencia fuerte: cada lectura ve lo último escrito por cualquier handle.
         db = await lancedb.connect_async(path, read_consistency_interval=timedelta(0))
         embeddings_schema = pa.schema(
