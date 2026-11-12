@@ -16,7 +16,7 @@ from semantic_spotter.store import ExtractedBlob, Sighting, Store
 
 
 # Sube cuando cambia lo que se extrae por snippet, para forzar la re-extracción.
-EXTRACT_VERSION = 3
+EXTRACT_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -77,17 +77,20 @@ async def index_tree(
         for f in await tree_files(store, repo, tree_oid)
         if gitsource.is_candidate(f.path, include_tests=options.include_tests)
     ]
-    missing = await store.missing_blobs(((f.blob_oid, f.language) for f in files), options.key)
-    if missing:
-        file_of = {(f.blob_oid, f.language): f for f in files}
-        sources = await gitsource.read_blobs(repo, sorted({oid for oid, _ in missing}))
-        # El parseo con tree-sitter es CPU pura y rápida: se hace en línea, sin threads.
-        extracted = [
-            _extract_blob(file_of[k], sources[k[0]], options)
-            for k in sorted(missing)
-            if k[0] in sources
-        ]
-        await store.save_blobs(options.key, options.normalizer, extracted)
+    keys = [(f.blob_oid, f.language) for f in files]
+    if await store.missing_blobs(keys, options.key):
+        async with store.writing():
+            # Otro proceso pudo haber guardado algunos mientras esperábamos el lock.
+            missing = await store.missing_blobs(keys, options.key)
+            file_of = {(f.blob_oid, f.language): f for f in files}
+            sources = await gitsource.read_blobs(repo, sorted({oid for oid, _ in missing}))
+            # El parseo con tree-sitter es CPU pura y rápida: se hace en línea, sin threads.
+            extracted = [
+                _extract_blob(file_of[k], sources[k[0]], options)
+                for k in sorted(missing)
+                if k[0] in sources
+            ]
+            await store.save_blobs(options.key, options.normalizer, extracted)
     return await store.load_snippets(files, options.key, options.normalizer)
 
 

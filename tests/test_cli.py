@@ -1,10 +1,13 @@
 import json
+import os
 import re
+import subprocess
+import sys
 
 import pytest
 from typer.testing import CliRunner
 
-from conftest import git
+from conftest import count_extractions, git
 
 from semantic_spotter import cli
 
@@ -241,3 +244,238 @@ def test_index_then_check_shows_first_seen(check_repo, make_repo):
     first_seen = {m["file_path"]: m["first_seen"] for m in group["members"]}
     assert first_seen["a/a.go"]["commit"] == original
     assert first_seen["b/b.go"] is None  # el commit nuevo todavía no se recorrió
+
+
+# --- marca de ignorar ------------------------------------------------------------
+
+
+def _marked(source, marker="semantic-spotter:ignore -- adaptador temporal"):
+    """Pone `// <marker>` en la línea anterior a cada función del archivo."""
+    return source.replace("\nfunc ", f"\n// {marker}\nfunc ")
+
+
+def test_check_passes_marked_copy(check_repo, make_repo):
+    make_repo({"b/b.go": _marked(LONG.format(pkg="b", name="ShippedIDs", status="shipped"))})
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == []
+    assert "1 grupos omitidos por marca de ignorar" in _plain(result.stderr)
+
+
+@pytest.mark.parametrize(
+    "marker", ["semantic-spotter:ignore", "semantic-spotter:ignore --", "semantic-spotter:ignore --  "]
+)
+def test_check_mark_without_reason_does_not_count(check_repo, make_repo, marker):
+    copy = _marked(LONG.format(pkg="b", name="ShippedIDs", status="shipped"), marker)
+    make_repo({"b/b.go": copy})
+    assert _check(check_repo, "--structural").exit_code == 1
+
+
+def test_check_marking_existing_function_changes_nothing(check_repo, make_repo):
+    make_repo({"a/a.go": _marked(LONG.format(pkg="a", name="PendingIDs", status="pending"))})
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == 0, result.output
+    assert "0 snippets cambiados" in _plain(result.stderr)
+
+
+def test_check_mark_does_not_cover_new_copies(check_repo, make_repo):
+    make_repo({"a/a.go": _marked(LONG.format(pkg="a", name="PendingIDs", status="pending"))})
+    make_repo({"b/b.go": LONG.format(pkg="b", name="ShippedIDs", status="shipped")})
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == 1, result.output
+    [group] = json.loads(result.stdout)
+    assert {m["file_path"] for m in group["members"]} == {"a/a.go", "b/b.go"}
+
+
+def test_check_needs_every_changed_member_marked(check_repo, make_repo):
+    make_repo(
+        {
+            "b/b.go": _marked(LONG.format(pkg="b", name="ShippedIDs", status="shipped")),
+            "d/d.go": LONG.format(pkg="d", name="DoneIDs", status="done"),
+        }
+    )
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == 1, result.output
+    [group] = json.loads(result.stdout)
+    assert {m["file_path"] for m in group["members"]} == {"a/a.go", "b/b.go", "d/d.go"}
+
+
+# El `for` de LONG dentro de una función que por lo demás no se le parece.
+HOST = """package b
+
+func Summarize(orders []Order, limit int, w io.Writer) error {
+	if limit <= 0 {
+		return errors.New("limit")
+	}
+	total := 0
+	for _, o := range orders {
+		total += o.Amount
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, limit)
+	for _, o := range orders {
+		if o.Status != "pending" || seen[o.ID] {
+			continue
+		}
+		seen[o.ID] = true
+		out = append(out, o.ID)
+		if len(out) >= limit {
+			break
+		}
+	}
+	_, err := fmt.Fprintf(w, "%d %v", total, out)
+	return err
+}
+"""
+
+
+@pytest.mark.parametrize("marked", [False, True])
+def test_check_mark_covers_inner_blocks(check_repo, make_repo, marked):
+    make_repo({"b/b.go": _marked(HOST) if marked else HOST})
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == 0, result.output
+    groups = json.loads(result.stdout)
+    if marked:
+        assert groups == []
+    else:
+        # Sin marca, el `for` copiado se reporta como grupo de solo bloques.
+        [group] = groups
+        assert group["blocks_only"]
+        assert {m["file_path"] for m in group["members"]} == {"a/a.go", "b/b.go"}
+
+
+def test_check_mark_silences_t3_warning(check_repo, make_repo):
+    make_repo({"b/b.go": _marked(TWEAKED.format(pkg="b", name="PendingIDs", status="pending"))})
+    result = _check(check_repo, "--structural", "--t3-jaccard", "0.6", "--fail-on", "t1")
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == []
+
+
+TS_BODY = """
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const o of orders) {
+    if (o.status !== "pending" || seen.has(o.id)) {
+      continue;
+    }
+    seen.add(o.id);
+    out.push(o.id);
+    if (out.length >= limit) {
+      break;
+    }
+  }
+  return out;
+"""
+TS_MARK = "// semantic-spotter:ignore -- variantes por tipo de orden\n"
+
+
+@pytest.mark.parametrize("marked", [False, True])
+def test_check_mark_in_typescript(check_repo, make_repo, marked):
+    mark = TS_MARK if marked else ""
+    signature = "(orders: Order[], limit: number): string[]"
+    make_repo(
+        {
+            "t/a.ts": f"{mark}export function pendingIds{signature} {{{TS_BODY}}}\n",
+            "t/b.ts": f"{mark}export const shippedIds = {signature} => {{{TS_BODY}}};\n",
+            "t/c.ts": f"export class Repo {{\n  {mark}  ids{signature} {{{TS_BODY}}}\n}}\n",
+        }
+    )
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == (0 if marked else 1), result.output
+
+
+def test_check_failure_explains_both_ways_out(check_repo, make_repo):
+    make_repo({"b/b.go": LONG.format(pkg="b", name="ShippedIDs", status="shipped")})
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == 1, result.output
+    stderr = " ".join(_plain(result.stderr).split())
+    assert "extrae la lógica compartida" in stderr
+    assert "// semantic-spotter:ignore -- <motivo>" in stderr
+
+
+def test_scan_omits_groups_with_every_member_marked(repo, make_repo):
+    make_repo(
+        {
+            "a/a.go": _marked(FUNC.format(pkg="a", name="CountItems")),
+            "b/b.go": _marked(FUNC.format(pkg="b", name="Tally")),
+        }
+    )
+    args = ["scan", str(repo), "--json", "--threshold", "0.8"]
+    result = CliRunner().invoke(cli.app, args)
+    assert result.exit_code == 0, result.output
+    [group] = json.loads(result.stdout)
+    assert len(group["members"]) == 3
+
+    make_repo({"mig/x/main.go": _marked(FUNC.format(pkg="main", name="Count"))})
+    result = CliRunner().invoke(cli.app, args)
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == []
+
+
+# --- índice compartido -----------------------------------------------------------
+
+
+def test_worktree_shares_index_in_git_common_dir(check_repo, tmp_path, monkeypatch):
+    assert _check(check_repo, "--structural").exit_code == 0
+    assert (check_repo / ".git" / "semantic-spotter").is_dir()
+    assert not (check_repo / ".semantic-spotter").exists()
+
+    worktree = tmp_path / "wt"
+    git(check_repo, "worktree", "add", "-q", "-b", "otra", str(worktree), "main")
+    (worktree / "b").mkdir()
+    (worktree / "b/b.go").write_text(LONG.format(pkg="b", name="ShippedIDs", status="shipped"))
+    git(worktree, "add", "-A")
+    git(worktree, "commit", "-q", "-m", "copia")
+
+    extracted = count_extractions(monkeypatch)
+    result = _check(worktree, "--structural")
+    assert result.exit_code == 1, result.output
+    # a/a.go y c/c.go ya los extrajo el otro worktree: solo se extrae lo nuevo.
+    assert extracted == ["b/b.go"]
+    assert not (worktree / ".semantic-spotter").exists()
+
+
+def test_index_path_from_env(check_repo, tmp_path, monkeypatch):
+    db = tmp_path / "indice" / "pruebas"
+    monkeypatch.setenv("SEMANTIC_SPOTTER_DB", str(db))
+    assert _check(check_repo, "--structural").exit_code == 0
+    assert any(db.iterdir())
+    assert not (check_repo / ".git" / "semantic-spotter").exists()
+
+    # Otro índice vacío: lo ya extraído en el de por defecto no cuenta.
+    monkeypatch.delenv("SEMANTIC_SPOTTER_DB")
+    extracted = count_extractions(monkeypatch)
+    assert _check(check_repo, "--structural").exit_code == 0
+    assert sorted(extracted) == ["a/a.go", "c/c.go"]
+
+
+def test_parallel_checks_share_index(check_repo, make_repo):
+    # Varios archivos para que las dos corridas compitan por las mismas escrituras.
+    make_repo(
+        {"b/b.go": LONG.format(pkg="b", name="ShippedIDs", status="shipped")}
+        | {f"o{i}/o.go": OTHER.replace("Render", f"Render{i}") for i in range(8)}
+    )
+    command = [
+        sys.executable,
+        "-c",
+        "from semantic_spotter import main; main()",
+        "check",
+        str(check_repo),
+        "--json",
+        "--structural",
+    ]
+    env = {k: v for k, v in os.environ.items() if k != "SEMANTIC_SPOTTER_DB"}
+    procs = [
+        subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        for _ in range(2)
+    ]
+    outputs = [p.communicate(timeout=120) for p in procs]
+    assert [p.returncode for p in procs] == [1, 1], [err for _, err in outputs]
+
+    # Mismo resultado que una corrida en serie sobre el índice ya escrito.
+    serial = _check(check_repo, "--structural")
+    assert serial.exit_code == 1, serial.output
+    expected = json.loads(serial.stdout)
+    assert [m["file_path"] for m in expected[0]["members"]] == ["a/a.go", "b/b.go"]
+    for out, _ in outputs:
+        assert json.loads(out) == expected

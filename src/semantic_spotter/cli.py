@@ -17,6 +17,7 @@ from semantic_spotter.detect import (
     candidate_pairs,
     changed_occurrences,
     classify_pairs,
+    drop_ignored,
     group_pairs,
     merge_pairs,
     query_pairs,
@@ -172,6 +173,16 @@ def _members(snippets: Sequence[Snippet], groups: Sequence[Group]) -> list[Snipp
     return [snippets[i] for g in groups for i in g.members]
 
 
+def _drop_ignored(
+    snippets: Sequence[Snippet], groups: Sequence[Group], changed: set[int] | None = None
+) -> list[Group]:
+    """`drop_ignored` avisando cuántos grupos omitió por marca de ignorar."""
+    kept = drop_ignored(snippets, groups, changed)
+    if omitted := len(groups) - len(kept):
+        err.print(f"{omitted} grupos omitidos por marca de ignorar")
+    return kept
+
+
 @app.callback()
 def _root() -> None:
     """Detecta clones semánticos en repos Go/TypeScript."""
@@ -285,7 +296,7 @@ async def _scan(
         ),
     )
     pairs = classify_pairs(snippets, pairs, t3_jaccard=t3_jaccard)
-    groups = group_pairs(snippets, pairs, max_group=max_group)
+    groups = _drop_ignored(snippets, group_pairs(snippets, pairs, max_group=max_group))
     seen = await store.first_seen(_members(snippets, groups), options.key)
     if as_json:
         print(json.dumps(groups_to_json(snippets, groups, seen=seen), indent=2, ensure_ascii=False))
@@ -301,6 +312,15 @@ async def _scan(
 
 
 # --- check ---------------------------------------------------------------------
+
+
+# Lo lee quien hace commit (a menudo un agente): las dos salidas, sin ir a la doc.
+_HOW_TO_FIX = (
+    "Para resolverlo, extrae la lógica compartida a una función y reutilízala desde "
+    "cada ubicación del grupo. Si la copia es intencional, agrega "
+    "`// semantic-spotter:ignore -- <motivo>` en la línea anterior a la función o "
+    "bloque nuevo; sin motivo la marca no cuenta."
+)
 
 
 def _parse_fail_on(value: str) -> frozenset[int]:
@@ -424,9 +444,9 @@ async def _check(
     if matrix is not None:
         pairs = merge_pairs(pairs, query_pairs(snippets, matrix, queries, threshold=threshold))
     pairs = classify_pairs(snippets, suppress_subsumed(snippets, pairs), t3_jaccard=t3_jaccard)
-    groups = group_pairs(snippets, pairs, max_group=max_group)
     changed = set(queries)
-    seen = await store.first_seen(_members(snippets, groups), options.key)
+    groups = _drop_ignored(snippets, group_pairs(snippets, pairs, max_group=max_group), changed)
+    seen =await store.first_seen(_members(snippets, groups), options.key)
     if as_json:
         report = groups_to_json(snippets, groups, changed, seen)
         print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -439,6 +459,7 @@ async def _check(
     labels = ", ".join(f"T{t}" for t in sorted(fail_on)) or "ninguno"
     if failing:
         err.print(f"[red]{len(failing)} grupos con clones {labels} introducidos por el cambio.[/]")
+        err.print(_HOW_TO_FIX)
         return 1
     err.print(f"[green]Sin clones {labels} introducidos por el cambio.[/]")
     return 0

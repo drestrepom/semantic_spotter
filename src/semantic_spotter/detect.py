@@ -1,7 +1,7 @@
 import heapq
 import itertools
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -389,6 +389,23 @@ def group_pairs(
         groups,
         key=lambda g: (g.blocks_only, g.interface_like, -(g.deletable_lines * g.mean_score)),
     )
+
+
+def drop_ignored(
+    snippets: Sequence[Snippet], groups: Sequence[Group], changed: Collection[int] | None = None
+) -> list[Group]:
+    """Quita los grupos cuyos miembros tienen todos marca de ignorar.
+
+    Con `changed` (en `check`) solo cuentan los miembros cambiados: el agente no
+    tiene que marcar código que no tocó, y una copia nueva sin marca de una
+    función marcada sigue reportándose.
+    """
+
+    def ignored(g: Group) -> bool:
+        judged = [i for i in g.members if changed is None or i in changed]
+        return bool(judged) and all(snippets[i].ignore_reason for i in judged)
+
+    return [g for g in groups if not ignored(g)]
 
 
 def _same_method(members: Sequence[Snippet]) -> bool:
