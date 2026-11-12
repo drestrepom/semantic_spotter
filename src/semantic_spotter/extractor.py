@@ -136,6 +136,7 @@ def extract(
                 end_byte=node.end_byte,
                 norm_hash=content_hash(" ".join(tokens)) if fingerprint else "",
                 shingles=shingles(tokens) if fingerprint else (),
+                token_count=len(tokens),
                 ignore_reason=reason,
             )
         )

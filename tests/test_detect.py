@@ -98,12 +98,12 @@ def test_classify_pairs_t1_to_t4():
 
 
 def test_renamed_pairs_found_below_threshold():
-    shingles = tuple(range(50))
+    big = {"norm_hash": "n", "shingles": tuple(range(50)), "token_count": 54}
     snippets = [
-        snip("a.go", 0, 10, norm_hash="n", shingles=shingles),
-        snip("b.go", 0, 10, norm_hash="n", shingles=shingles),
-        snip("c.go", 0, 10, norm_hash="n", shingles=(1, 2)),  # demasiado corto
-        snip("a.go", 2, 8, unit="block", norm_hash="n", shingles=shingles),  # solapado
+        snip("a.go", 0, 10, **big),
+        snip("b.go", 0, 10, **big),
+        snip("c.go", 0, 10, norm_hash="n", shingles=(1, 2), token_count=6),  # demasiado corto
+        snip("a.go", 2, 8, unit="block", **big),  # solapado
     ]
     matrix = np.array([[1, 0], [0.6, 0.8], [1, 0], [1, 0]], dtype=np.float32)
     assert candidate_pairs(snippets, matrix, threshold=0.9) == [Pair(0, 2, 1.0), Pair(2, 3, 1.0)]
@@ -164,6 +164,7 @@ def test_structural_pairs_without_embeddings():
         snip("d.go", 0, 10, norm_hash="y", shingles=tuple(range(1000, 1100))),  # nada
         snip("q.go", 2, 8, unit="block", norm_hash="n", shingles=long),  # solapado
     ]
+    snippets = [replace(s, token_count=104) for s in snippets]
     pairs = structural_pairs(snippets, [0], t3_jaccard=0.8)
     assert {(p.a, p.b) for p in pairs} == {(0, 1), (0, 2), (0, 3)}
     types = {p.b: p.clone_type for p in classify_pairs(snippets, pairs, t3_jaccard=0.8)}
@@ -174,7 +175,7 @@ def test_structural_pairs_without_embeddings():
     assert all(p.score == 0 for p in structural_pairs(snippets, [0], matrix, t3_jaccard=0.8))
 
     # Las unidades cortas solo cuentan como copia exacta.
-    short = [replace(s, shingles=(1, 2)) for s in snippets]
+    short = [replace(s, token_count=6) for s in snippets]
     assert {(p.a, p.b) for p in structural_pairs(short, [0], t3_jaccard=0.8)} == {(0, 1)}
 
 

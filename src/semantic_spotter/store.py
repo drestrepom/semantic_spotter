@@ -34,7 +34,7 @@ _LOCK_TIMEOUT_SECONDS = 60.0
 
 # Ningún esquema guarda el texto de los snippets: se recupera de los blobs de git.
 # El sufijo cambia cuando cambia el esquema; las tablas viejas quedan sin uso.
-_SUFFIX = "_v4"
+_SUFFIX = "_v5"
 
 # Marca que un árbol quedó registrado completo en `tree_files`.
 _TREES_SCHEMA = pa.schema(
@@ -84,6 +84,7 @@ _CONTENTS_SCHEMA = pa.schema(
         pa.field("normalizer", pa.string()),
         pa.field("norm_hash", pa.string()),
         pa.field("shingles", pa.list_(pa.int64())),
+        pa.field("token_count", pa.int64()),
     ]
 )
 
@@ -200,7 +201,7 @@ class Store:
     - `trees` + `tree_files`: (ruta, blob) de cada árbol registrado.
     - `blobs` + `blob_snippets`: snippets de cada blob por config de extracción;
       un blob se extrae una sola vez aunque aparezca en muchos commits.
-    - `contents`: `norm_hash` y shingles por `content_hash`.
+    - `contents`: `norm_hash`, shingles y cantidad de tokens por `content_hash`.
     - `history` + `first_seen`: commits recorridos por `index` y el primero en
       que apareció cada (ruta, contenido).
     - `embeddings__<modelo>__<dim>`: vector por `content_hash`.
@@ -398,6 +399,7 @@ class Store:
                 "normalizer": normalizer,
                 "norm_hash": s.norm_hash,
                 "shingles": list(s.shingles),
+                "token_count": s.token_count,
             }
             for h, s in by_hash.items()
             if h not in existing
@@ -407,16 +409,19 @@ class Store:
 
     async def _load_contents(
         self, hashes: Iterable[str], normalizer: str
-    ) -> dict[str, tuple[str, tuple[int, ...]]]:
-        out: dict[str, tuple[str, tuple[int, ...]]] = {}
+    ) -> dict[str, tuple[str, tuple[int, ...], int]]:
+        out: dict[str, tuple[str, tuple[int, ...], int]] = {}
         norm = f"normalizer = {_sql_str(normalizer)}"
         for chunk in _chunks(sorted(set(hashes))):
             rows = await self._rows(
                 self._contents,
                 f"{norm} AND {_in('content_hash', chunk)}",
-                ["content_hash", "norm_hash", "shingles"],
+                ["content_hash", "norm_hash", "shingles", "token_count"],
             )
-            out.update((r["content_hash"], (r["norm_hash"], tuple(r["shingles"]))) for r in rows)
+            out.update(
+                (r["content_hash"], (r["norm_hash"], tuple(r["shingles"]), r["token_count"]))
+                for r in rows
+            )
         return out
 
     async def load_snippets(
@@ -439,12 +444,9 @@ class Store:
         snippets = []
         for f in files:
             for r in by_blob.get((f.blob_oid, f.language), []):
-                norm_hash, shingles = contents.get(r["content_hash"], ("", ()))
-                snippets.append(
-                    Snippet(
-                        **r | {"file_path": f.path, "norm_hash": norm_hash, "shingles": shingles}
-                    )
-                )
+                norm_hash, shingles, tokens = contents.get(r["content_hash"], ("", (), 0))
+                fingerprint = {"norm_hash": norm_hash, "shingles": shingles, "token_count": tokens}
+                snippets.append(Snippet(**r | {"file_path": f.path} | fingerprint))
         return sorted(snippets, key=lambda s: (s.file_path, s.start_byte, s.end_byte))
 
     # --- historial ------------------------------------------------------------
