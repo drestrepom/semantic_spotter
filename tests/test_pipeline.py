@@ -1,3 +1,5 @@
+from conftest import count_extractions
+
 from semantic_spotter import pipeline
 from semantic_spotter.pipeline import (
     EmbeddingPlan,
@@ -9,7 +11,7 @@ from semantic_spotter.pipeline import (
     plan_embeddings,
     run_embeddings,
 )
-from semantic_spotter.store import DB_DIRNAME, Store
+from semantic_spotter.store import Store
 
 GO_A = """package a
 
@@ -33,23 +35,10 @@ async def _scan(repo, sha, embedder, options=ExtractOptions()):
     return store, snippets
 
 
-def _count_extractions(monkeypatch):
-    calls = []
-    original = pipeline._extract_blob
-
-    def spy(file, source, options):
-        calls.append(file.path)
-        return original(file, source, options)
-
-    monkeypatch.setattr(pipeline, "_extract_blob", spy)
-    return calls
-
-
 async def test_skips_generated_and_tests(make_repo, fake_embedder):
     repo, sha = make_repo({"a.go": GO_A, "gen.go": GO_GEN, "a_test.go": GO_A})
     _, snippets = await _scan(repo, sha, fake_embedder)
     assert {s.file_path for s in snippets} == {"a.go"}
-    assert (repo / DB_DIRNAME / ".gitignore").read_text() == "*\n"
     # Los tests se filtran al consultar, no al extraer: el mismo árbol los incluye.
     _, with_tests = await _scan(repo, sha, fake_embedder, ExtractOptions(include_tests=True))
     assert {s.file_path for s in with_tests} == {"a.go", "a_test.go"}
@@ -61,7 +50,7 @@ async def test_cache_avoids_reembedding(make_repo, fake_embedder, monkeypatch):
     assert len(fake_embedder.embedded) == len(snippets) > 0
 
     # Mismo commit: nada nuevo que embeber ni que extraer.
-    extracted = _count_extractions(monkeypatch)
+    extracted = count_extractions(monkeypatch)
     _, again = await _scan(repo, sha1, fake_embedder)
     assert again == snippets
     assert extracted == []
@@ -103,7 +92,7 @@ async def test_new_extract_version_reextracts_without_reembedding(
     embedded = len(fake_embedder.embedded)
 
     monkeypatch.setattr(pipeline, "EXTRACT_VERSION", pipeline.EXTRACT_VERSION + 1)
-    extracted = _count_extractions(monkeypatch)
+    extracted = count_extractions(monkeypatch)
     _, again = await _scan(repo, sha, fake_embedder)
     assert again == snippets
     assert extracted == ["a.go"]

@@ -8,6 +8,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from semantic_spotter import pipeline
+
 
 class FakeEmbedder:
     """Embeddings deterministas por feature hashing de tokens.
@@ -41,6 +43,12 @@ class FakeEmbedder:
         return out
 
 
+@pytest.fixture(autouse=True)
+def _default_index(monkeypatch):
+    """Cada test usa el índice por defecto de su repo, no uno del entorno."""
+    monkeypatch.delenv("SEMANTIC_SPOTTER_DB", raising=False)
+
+
 @pytest.fixture
 def fake_embedder() -> FakeEmbedder:
     return FakeEmbedder()
@@ -72,3 +80,16 @@ def make_repo(tmp_path: Path):
         return repo, git(repo, "rev-parse", "HEAD")
 
     return _make
+
+
+def count_extractions(monkeypatch) -> list[str]:
+    """Espía la extracción: devuelve la lista (viva) de rutas extraídas."""
+    calls: list[str] = []
+    original = pipeline._extract_blob
+
+    def spy(file, source, options):
+        calls.append(file.path)
+        return original(file, source, options)
+
+    monkeypatch.setattr(pipeline, "_extract_blob", spy)
+    return calls

@@ -1,11 +1,16 @@
+import asyncio
+import fcntl
 import itertools
+import os
 import re
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+import functools
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, Concatenate, Self
 
 import lancedb
 import numpy as np
@@ -13,9 +18,16 @@ import pyarrow as pa
 from lancedb.db import AsyncConnection
 from lancedb.table import AsyncTable
 
+from semantic_spotter import gitsource
 from semantic_spotter.models import Snippet, TreeFile
 
-DB_DIRNAME = ".semantic-spotter"
+# Nombre del índice dentro del directorio común de git.
+DB_DIRNAME = "semantic-spotter"
+# Si está definida, reemplaza la ruta por defecto del índice.
+DB_ENV = "SEMANTIC_SPOTTER_DB"
+# Archivo dentro del índice sobre el que se toma el `flock` de escritura.
+_LOCK_FILENAME = "write.lock"
+_LOCK_POLL_SECONDS = 0.02
 
 # Ningún esquema guarda el texto de los snippets: se recupera de los blobs de git.
 # El sufijo cambia cuando cambia el esquema; las tablas viejas quedan sin uso.
@@ -112,6 +124,36 @@ def _chunks(values: Iterable[str]) -> Iterable[list[str]]:
     return (list(c) for c in itertools.batched(values, _IN_CHUNK))
 
 
+@asynccontextmanager
+async def _flock(lock_path: Path) -> AsyncIterator[None]:
+    """`flock` exclusivo sobre `lock_path` (macOS y Linux), sin bloquear el event loop."""
+    with open(lock_path, "a") as lock:
+        # Se reintenta sin bloquear hasta que el otro proceso suelte el lock.
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                await asyncio.sleep(_LOCK_POLL_SECONDS)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _locked[**P, R](
+    method: Callable[Concatenate["Store", P], Awaitable[R]],
+) -> Callable[Concatenate["Store", P], Awaitable[R]]:
+    """La escritura completa corre con el lock del índice tomado."""
+
+    @functools.wraps(method)
+    async def wrapper(self: "Store", *args: P.args, **kwargs: P.kwargs) -> R:
+        async with self.writing():
+            return await method(self, *args, **kwargs)
+
+    return wrapper
+
+
 @dataclass(frozen=True, slots=True)
 class Sighting:
     """Dónde y cuándo se vio por primera vez un (ruta, contenido)."""
@@ -130,8 +172,19 @@ class ExtractedBlob:
     snippets: Sequence[Snippet]
 
 
+async def index_dir(repo_root: Path) -> Path:
+    """`$SEMANTIC_SPOTTER_DB` o `<directorio común de git>/semantic-spotter/`.
+
+    El directorio común es el mismo para todos los worktrees, así que un
+    worktree nuevo encuentra ya extraído lo que extrajeron los demás.
+    """
+    if override := os.environ.get(DB_ENV):
+        return Path(override)
+    return await gitsource.common_dir(repo_root) / DB_DIRNAME
+
+
 class Store:
-    """Índice local en `<repo>/.semantic-spotter/`.
+    """Índice compartido por los worktrees del repo (ver `index_dir`).
 
     - `commits`: commit → árbol, para los commits analizados.
     - `trees` + `tree_files`: (ruta, blob) de cada árbol registrado.
@@ -143,8 +196,12 @@ class Store:
     - `embeddings__<modelo>__<dim>`: vector por `content_hash`.
     """
 
-    def __init__(self, db: AsyncConnection, tables: dict[str, AsyncTable], dim: int) -> None:
+    def __init__(
+        self, db: AsyncConnection, tables: dict[str, AsyncTable], dim: int, lock_path: Path
+    ) -> None:
         self._db = db
+        self._lock_path = lock_path
+        self._writer: asyncio.Task[Any] | None = None
         self._commits = tables["commits"]
         self._trees = tables["trees"]
         self._tree_files = tables["tree_files"]
@@ -158,11 +215,8 @@ class Store:
 
     @classmethod
     async def open(cls, repo_root: Path, model: str, dim: int) -> Self:
-        path = repo_root / DB_DIRNAME
-        path.mkdir(exist_ok=True)
-        gitignore = path / ".gitignore"
-        if not gitignore.exists():
-            gitignore.write_text("*\n")
+        path = await index_dir(repo_root)
+        path.mkdir(parents=True, exist_ok=True)
         # Consistencia fuerte: cada lectura ve lo último escrito por cualquier handle.
         db = await lancedb.connect_async(path, read_consistency_interval=timedelta(0))
         embeddings_schema = pa.schema(
@@ -182,11 +236,33 @@ class Store:
             "first_seen" + _SUFFIX: _FIRST_SEEN_SCHEMA,
             "embeddings__" + re.sub(r"\W", "_", model) + f"__{dim}": embeddings_schema,
         }
+        lock_path = path / _LOCK_FILENAME
         tables = {}
-        for name, schema in schemas.items():
-            key = name.removesuffix(_SUFFIX) if name.endswith(_SUFFIX) else "embeddings"
-            tables[key] = await db.create_table(name, schema=schema, exist_ok=True)
-        return cls(db, tables, dim)
+        # Crear las tablas también es escribir: dos primeras corridas a la vez no chocan.
+        async with _flock(lock_path):
+            for name, schema in schemas.items():
+                key = name.removesuffix(_SUFFIX) if name.endswith(_SUFFIX) else "embeddings"
+                tables[key] = await db.create_table(name, schema=schema, exist_ok=True)
+        return cls(db, tables, dim, lock_path)
+
+    @asynccontextmanager
+    async def writing(self) -> AsyncIterator[None]:
+        """Lock exclusivo de escritura sobre el índice, compartido entre procesos.
+
+        Usa `flock` sobre un archivo del índice. Es reentrante dentro de la misma
+        tarea, así que una operación compuesta (re-consultar y guardar) puede
+        envolver escrituras que también lo toman. Las lecturas no lo necesitan.
+        """
+        task = asyncio.current_task()
+        if task is not None and self._writer is task:
+            yield
+            return
+        async with _flock(self._lock_path):
+            self._writer = task
+            try:
+                yield
+            finally:
+                self._writer = None
 
     async def _rows(
         self, table: AsyncTable, where: str, columns: Sequence[str] | None = None
@@ -198,6 +274,7 @@ class Store:
 
     # --- commits y árboles ----------------------------------------------------
 
+    @_locked
     async def link_commit(self, sha: str, tree_oid: str) -> None:
         if await self._commits.count_rows(f"commit_sha = {_sql_str(sha)}"):
             return
@@ -210,7 +287,10 @@ class Store:
     async def has_tree(self, tree_oid: str) -> bool:
         return await self._trees.count_rows(f"tree_oid = {_sql_str(tree_oid)}") > 0
 
+    @_locked
     async def save_tree(self, tree_oid: str, files: Sequence[TreeFile]) -> None:
+        if await self.has_tree(tree_oid):
+            return  # otro proceso lo registró mientras esperábamos el lock
         where = f"tree_oid = {_sql_str(tree_oid)}"
         # Limpia restos de un registro interrumpido antes de escribir.
         await self._tree_files.delete(where)
@@ -248,6 +328,7 @@ class Store:
             done.update((r["blob_oid"], r["language"]) for r in rows)
         return wanted - done
 
+    @_locked
     async def save_blobs(
         self, extract_key: str, normalizer: str, blobs: Sequence[ExtractedBlob]
     ) -> None:
@@ -360,6 +441,7 @@ class Store:
         )
         return {(r["path"], r["content_hash"]) for r in rows}
 
+    @_locked
     async def save_history(
         self,
         extract_key: str,
@@ -415,12 +497,18 @@ class Store:
         cached = await self._cached_hashes()
         return [h for h in dict.fromkeys(hashes) if h not in cached]
 
+    @_locked
     async def add_embeddings(self, hashes: Sequence[str], vectors: np.ndarray) -> None:
-        flat = pa.array(vectors.astype(np.float32).ravel())
+        # Otro proceso pudo haber guardado algunos mientras se embebían.
+        cached = await self._cached_hashes()
+        keep = [i for i, h in enumerate(hashes) if h not in cached]
+        if not keep:
+            return
+        flat = pa.array(vectors[keep].astype(np.float32).ravel())
         await self._embeddings.add(
             pa.table(
                 {
-                    "content_hash": pa.array(hashes, pa.string()),
+                    "content_hash": pa.array([hashes[i] for i in keep], pa.string()),
                     "vector": pa.FixedSizeListArray.from_arrays(flat, self.dim),
                 }
             )

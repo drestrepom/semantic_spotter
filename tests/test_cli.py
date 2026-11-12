@@ -1,10 +1,13 @@
 import json
+import os
 import re
+import subprocess
+import sys
 
 import pytest
 from typer.testing import CliRunner
 
-from conftest import git
+from conftest import count_extractions, git
 
 from semantic_spotter import cli
 
@@ -241,3 +244,72 @@ def test_index_then_check_shows_first_seen(check_repo, make_repo):
     first_seen = {m["file_path"]: m["first_seen"] for m in group["members"]}
     assert first_seen["a/a.go"]["commit"] == original
     assert first_seen["b/b.go"] is None  # el commit nuevo todavía no se recorrió
+
+
+# --- índice compartido -----------------------------------------------------------
+
+
+def test_worktree_shares_index_in_git_common_dir(check_repo, tmp_path, monkeypatch):
+    assert _check(check_repo, "--structural").exit_code == 0
+    assert (check_repo / ".git" / "semantic-spotter").is_dir()
+    assert not (check_repo / ".semantic-spotter").exists()
+
+    worktree = tmp_path / "wt"
+    git(check_repo, "worktree", "add", "-q", "-b", "otra", str(worktree), "main")
+    (worktree / "b").mkdir()
+    (worktree / "b/b.go").write_text(LONG.format(pkg="b", name="ShippedIDs", status="shipped"))
+    git(worktree, "add", "-A")
+    git(worktree, "commit", "-q", "-m", "copia")
+
+    extracted = count_extractions(monkeypatch)
+    result = _check(worktree, "--structural")
+    assert result.exit_code == 1, result.output
+    # a/a.go y c/c.go ya los extrajo el otro worktree: solo se extrae lo nuevo.
+    assert extracted == ["b/b.go"]
+    assert not (worktree / ".semantic-spotter").exists()
+
+
+def test_index_path_from_env(check_repo, tmp_path, monkeypatch):
+    db = tmp_path / "indice" / "pruebas"
+    monkeypatch.setenv("SEMANTIC_SPOTTER_DB", str(db))
+    assert _check(check_repo, "--structural").exit_code == 0
+    assert any(db.iterdir())
+    assert not (check_repo / ".git" / "semantic-spotter").exists()
+
+    # Otro índice vacío: lo ya extraído en el de por defecto no cuenta.
+    monkeypatch.delenv("SEMANTIC_SPOTTER_DB")
+    extracted = count_extractions(monkeypatch)
+    assert _check(check_repo, "--structural").exit_code == 0
+    assert sorted(extracted) == ["a/a.go", "c/c.go"]
+
+
+def test_parallel_checks_share_index(check_repo, make_repo):
+    # Varios archivos para que las dos corridas compitan por las mismas escrituras.
+    make_repo(
+        {"b/b.go": LONG.format(pkg="b", name="ShippedIDs", status="shipped")}
+        | {f"o{i}/o.go": OTHER.replace("Render", f"Render{i}") for i in range(8)}
+    )
+    command = [
+        sys.executable,
+        "-c",
+        "from semantic_spotter import main; main()",
+        "check",
+        str(check_repo),
+        "--json",
+        "--structural",
+    ]
+    env = {k: v for k, v in os.environ.items() if k != "SEMANTIC_SPOTTER_DB"}
+    procs = [
+        subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        for _ in range(2)
+    ]
+    outputs = [p.communicate(timeout=120) for p in procs]
+    assert [p.returncode for p in procs] == [1, 1], [err for _, err in outputs]
+
+    # Mismo resultado que una corrida en serie sobre el índice ya escrito.
+    serial = _check(check_repo, "--structural")
+    assert serial.exit_code == 1, serial.output
+    expected = json.loads(serial.stdout)
+    assert [m["file_path"] for m in expected[0]["members"]] == ["a/a.go", "b/b.go"]
+    for out, _ in outputs:
+        assert json.loads(out) == expected

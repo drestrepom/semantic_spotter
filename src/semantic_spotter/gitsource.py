@@ -48,6 +48,13 @@ async def repo_root(path: Path) -> Path:
     return Path((await _git(path, "rev-parse", "--show-toplevel")).decode().strip())
 
 
+async def common_dir(repo: Path) -> Path:
+    """Directorio común de git: el mismo para todos los worktrees del repo."""
+    out = (await _git(repo, "rev-parse", "--git-common-dir")).decode().strip()
+    # Puede venir relativo (p. ej. `.git`) respecto del repo.
+    return (repo / out).resolve()
+
+
 async def resolve_rev(repo: Path, rev: str) -> str:
     return (await _git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")).decode().strip()
 
