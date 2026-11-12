@@ -40,7 +40,7 @@ from semantic_spotter.pipeline import (
     run_embeddings,
 )
 from semantic_spotter.report import groups_to_json, pairs_to_json, print_groups, print_pairs
-from semantic_spotter.store import Store
+from semantic_spotter.store import IndexBusy, Store
 
 DEFAULT_MODEL = "voyage-code-4"
 DIM = 1024
@@ -112,7 +112,14 @@ def make_embedder(model: str) -> Embedder:
 async def _open_store(repo: Path, model: str) -> Store:
     load_dotenv(find_dotenv(usecwd=True))
     load_dotenv(repo / ".env")
-    return await Store.open(repo, model, DIM)
+    return await Store.open(
+        repo,
+        model,
+        DIM,
+        on_lock_wait=lambda: err.print(
+            "Esperando a que otro proceso termine de escribir el índice…"
+        ),
+    )
 
 
 def _git_error(exc: gitsource.GitError) -> typer.Exit:
@@ -132,6 +139,9 @@ def _run[T](command: Coroutine[Any, Any, T]) -> T:
         raise
     except typer.Abort as exc:
         err.print("[red]Cancelado.[/]")
+        raise typer.Exit(2) from exc
+    except IndexBusy as exc:
+        err.print(f"[red]{exc}[/]")
         raise typer.Exit(2) from exc
     except Exception as exc:
         err.print_exception()

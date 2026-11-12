@@ -3,8 +3,9 @@ import fcntl
 import itertools
 import os
 import re
+import time
 from collections import defaultdict
-from collections.abc import AsyncIterator, Iterable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
@@ -27,6 +28,9 @@ DB_ENV = "SEMANTIC_SPOTTER_DB"
 # Archivo dentro del índice sobre el que se toma el `flock` de escritura.
 _LOCK_FILENAME = "write.lock"
 _LOCK_POLL_SECONDS = 0.02
+# Tras esta espera se avisa; tras la segunda se falla, en vez de colgar el hook.
+_LOCK_WARN_SECONDS = 1.0
+_LOCK_TIMEOUT_SECONDS = 60.0
 
 # Ningún esquema guarda el texto de los snippets: se recupera de los blobs de git.
 # El sufijo cambia cuando cambia el esquema; las tablas viejas quedan sin uso.
@@ -125,16 +129,31 @@ def _chunks(values: Iterable[str]) -> Iterable[list[str]]:
     return (list(c) for c in itertools.batched(values, _IN_CHUNK))
 
 
+class IndexBusy(RuntimeError):
+    """Otro proceso retuvo el lock del índice más de `_LOCK_TIMEOUT_SECONDS`."""
+
+
 @asynccontextmanager
-async def _flock(lock_path: Path) -> AsyncIterator[None]:
+async def _flock(lock_path: Path, on_wait: Callable[[], None] | None) -> AsyncIterator[None]:
     """`flock` exclusivo sobre `lock_path` (macOS y Linux), sin bloquear el event loop."""
     with open(lock_path, "a") as lock:
         # Se reintenta sin bloquear hasta que el otro proceso suelte el lock.
+        start = time.monotonic()
+        warned = False
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
+                waited = time.monotonic() - start
+                if waited >= _LOCK_TIMEOUT_SECONDS:
+                    raise IndexBusy(
+                        f"El índice {lock_path.parent} sigue bloqueado por otro proceso "
+                        f"tras {waited:.0f} s; vuelve a intentarlo cuando termine."
+                    ) from None
+                if not warned and waited >= _LOCK_WARN_SECONDS and on_wait is not None:
+                    on_wait()
+                    warned = True
                 await asyncio.sleep(_LOCK_POLL_SECONDS)
         try:
             yield
@@ -185,10 +204,16 @@ class Store:
     """
 
     def __init__(
-        self, db: AsyncConnection, tables: dict[str, AsyncTable], dim: int, lock_path: Path
+        self,
+        db: AsyncConnection,
+        tables: dict[str, AsyncTable],
+        dim: int,
+        lock_path: Path,
+        on_lock_wait: Callable[[], None] | None,
     ) -> None:
         self._db = db
         self._lock_path = lock_path
+        self._on_lock_wait = on_lock_wait
         self._commits = tables["commits"]
         self._trees = tables["trees"]
         self._tree_files = tables["tree_files"]
@@ -201,7 +226,15 @@ class Store:
         self.dim = dim
 
     @classmethod
-    async def open(cls, repo_root: Path, model: str, dim: int) -> Self:
+    async def open(
+        cls,
+        repo_root: Path,
+        model: str,
+        dim: int,
+        *,
+        on_lock_wait: Callable[[], None] | None = None,
+    ) -> Self:
+        """Abre (o crea) el índice; `on_lock_wait` se llama si el lock tarda en llegar."""
         path = await index_dir(repo_root)
         path.mkdir(parents=True, exist_ok=True)
         # Consistencia fuerte: cada lectura ve lo último escrito por cualquier handle.
@@ -226,11 +259,11 @@ class Store:
         lock_path = path / _LOCK_FILENAME
         tables = {}
         # Crear las tablas también es escribir: dos primeras corridas a la vez no chocan.
-        async with _flock(lock_path):
+        async with _flock(lock_path, on_lock_wait):
             for name, schema in schemas.items():
                 key = name.removesuffix(_SUFFIX) if name.endswith(_SUFFIX) else "embeddings"
                 tables[key] = await db.create_table(name, schema=schema, exist_ok=True)
-        return cls(db, tables, dim, lock_path)
+        return cls(db, tables, dim, lock_path, on_lock_wait)
 
     @asynccontextmanager
     async def writing(self) -> AsyncIterator[None]:
@@ -241,7 +274,7 @@ class Store:
         Cada uno vuelve a consultar, ya con el lock, qué falta escribir. Las
         lecturas no lo necesitan.
         """
-        async with _flock(self._lock_path):
+        async with _flock(self._lock_path, self._on_lock_wait):
             yield
 
     async def _rows(

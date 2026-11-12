@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -10,7 +11,8 @@ from typer.testing import CliRunner
 
 from conftest import count_extractions, git
 
-from semantic_spotter import cli
+from semantic_spotter import cli, store
+from semantic_spotter.store import Store
 
 FUNC = """package {pkg}
 
@@ -473,6 +475,19 @@ def test_index_path_from_env(check_repo, tmp_path, monkeypatch):
     extracted = count_extractions(monkeypatch)
     assert _check(check_repo, "--structural").exit_code == 0
     assert sorted(extracted) == ["a/a.go", "c/c.go"]
+
+
+async def test_check_gives_up_on_held_lock(check_repo, monkeypatch):
+    monkeypatch.setattr(store, "_LOCK_WARN_SECONDS", 0.05)
+    monkeypatch.setattr(store, "_LOCK_TIMEOUT_SECONDS", 0.5)
+    other = await Store.open(check_repo, cli.DEFAULT_MODEL, cli.DIM)
+    # Otro proceso escribe y no suelta el lock; este check en frío necesita escribir.
+    async with other.writing():
+        result = await asyncio.to_thread(_check, check_repo, "--structural")
+    assert result.exit_code == 2, result.output
+    stderr = " ".join(_plain(result.stderr).split())
+    assert "Esperando a que otro proceso termine de escribir el índice" in stderr
+    assert "sigue bloqueado" in stderr
 
 
 def test_parallel_checks_share_index(check_repo, make_repo):
