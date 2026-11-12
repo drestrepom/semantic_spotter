@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 
 from conftest import count_extractions, git
 
-from semantic_spotter import cli, store
+from semantic_spotter import cli, gitsource, pipeline, store
 from semantic_spotter.store import Store
 
 FUNC = """package {pkg}
@@ -225,6 +225,18 @@ def test_check_flags_renamed_repetitive_function(check_repo, make_repo):
     assert result.exit_code == 1, result.output
     [group] = json.loads(result.stdout)
     assert group["clone_type"] == 2
+
+
+def test_new_selection_rules_relist_cached_trees(check_repo, make_repo, monkeypatch):
+    make_repo({"vendor/v/v.go": LONG.format(pkg="v", name="ShippedIDs", status="shipped")})
+    assert _check(check_repo, "--structural").exit_code == 0
+
+    # Una versión nueva deja de tratar vendor/ como ruido: el árbol ya registrado
+    # se vuelve a listar con las reglas nuevas.
+    monkeypatch.setattr(gitsource, "_NOISE_DIRS", frozenset())
+    monkeypatch.setattr(pipeline, "SELECT_VERSION", pipeline.SELECT_VERSION + 1)
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == 1, result.output
 
 
 def test_check_skips_generated_file_with_crlf(check_repo, make_repo):

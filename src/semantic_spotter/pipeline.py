@@ -17,6 +17,9 @@ from semantic_spotter.store import ExtractedBlob, Sighting, Store
 
 # Sube cuando cambia lo que se extrae por snippet, para forzar la re-extracción.
 EXTRACT_VERSION = 5
+# Sube cuando cambian las reglas que eligen los archivos de un árbol (extensiones,
+# directorios de ruido, sufijos generados), para volver a listar los ya registrados.
+SELECT_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -57,15 +60,16 @@ def _extract_blob(file: TreeFile, source: bytes, options: ExtractOptions) -> Ext
 
 async def tree_files(store: Store, repo: Path, tree_oid: str) -> list[TreeFile]:
     """Archivos de lenguajes soportados del árbol; se registran la primera vez."""
-    if await store.has_tree(tree_oid):
-        return await store.load_tree(tree_oid)
+    selection = f"s{SELECT_VERSION}"
+    if await store.has_tree(tree_oid, selection):
+        return await store.load_tree(tree_oid, selection)
     files = [
         TreeFile(f.path, f.oid, spec.name)
         for f in await gitsource.list_files(repo, tree_oid)
         if (spec := spec_for(f.path)) and gitsource.is_candidate(f.path, include_tests=True)
     ]
     async with store.writing():
-        await store.save_tree(tree_oid, files)
+        await store.save_tree(tree_oid, selection, files)
     return files
 
 

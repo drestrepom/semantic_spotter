@@ -36,14 +36,20 @@ _LOCK_TIMEOUT_SECONDS = 60.0
 # El sufijo cambia cuando cambia el esquema; las tablas viejas quedan sin uso.
 _SUFFIX = "_v5"
 
-# Marca que un árbol quedó registrado completo en `tree_files`.
+# Marca que un árbol quedó registrado completo en `tree_files`; `selection`
+# versiona las reglas que eligen sus archivos, como `extract_key` la extracción.
 _TREES_SCHEMA = pa.schema(
-    [pa.field("tree_oid", pa.string()), pa.field("file_count", pa.int64())]
+    [
+        pa.field("tree_oid", pa.string()),
+        pa.field("selection", pa.string()),
+        pa.field("file_count", pa.int64()),
+    ]
 )
 # Archivos de lenguajes soportados de cada árbol.
 _TREE_FILES_SCHEMA = pa.schema(
     [
         pa.field("tree_oid", pa.string()),
+        pa.field("selection", pa.string()),
         pa.field("path", pa.string()),
         pa.field("blob_oid", pa.string()),
         pa.field("language", pa.string()),
@@ -198,7 +204,8 @@ async def index_dir(repo_root: Path) -> Path:
 class Store:
     """Índice compartido por los worktrees del repo (ver `index_dir`).
 
-    - `trees` + `tree_files`: (ruta, blob) de cada árbol registrado.
+    - `trees` + `tree_files`: (ruta, blob) de cada árbol registrado, por reglas de
+      selección de archivos.
     - `blobs` + `blob_snippets`: snippets de cada blob por config de extracción;
       un blob se extrae una sola vez aunque aparezca en muchos commits.
     - `contents`: `norm_hash`, shingles y cantidad de tokens por `content_hash`.
@@ -302,30 +309,33 @@ class Store:
 
     # --- árboles --------------------------------------------------------------
 
-    async def has_tree(self, tree_oid: str) -> bool:
-        return await self._trees.count_rows(f"tree_oid = {_sql_str(tree_oid)}") > 0
+    @staticmethod
+    def _tree_where(tree_oid: str, selection: str) -> str:
+        return f"tree_oid = {_sql_str(tree_oid)} AND selection = {_sql_str(selection)}"
 
-    async def save_tree(self, tree_oid: str, files: Sequence[TreeFile]) -> None:
-        if await self.has_tree(tree_oid):
+    async def has_tree(self, tree_oid: str, selection: str) -> bool:
+        return await self._trees.count_rows(self._tree_where(tree_oid, selection)) > 0
+
+    async def save_tree(self, tree_oid: str, selection: str, files: Sequence[TreeFile]) -> None:
+        if await self.has_tree(tree_oid, selection):
             return  # otro proceso lo registró mientras esperábamos el lock
-        where = f"tree_oid = {_sql_str(tree_oid)}"
         # Limpia restos de un registro interrumpido antes de escribir.
-        await self._tree_files.delete(where)
+        await self._tree_files.delete(self._tree_where(tree_oid, selection))
         if files:
             rows = [
-                {"tree_oid": tree_oid, "path": f.path, "blob_oid": f.blob_oid, "language": f.language}
+                {"tree_oid": tree_oid, "selection": selection}
+                | {"path": f.path, "blob_oid": f.blob_oid, "language": f.language}
                 for f in files
             ]
             await self._tree_files.add(pa.Table.from_pylist(rows, schema=_TREE_FILES_SCHEMA))
-        await self._trees.add(
-            pa.Table.from_pylist(
-                [{"tree_oid": tree_oid, "file_count": len(files)}], schema=_TREES_SCHEMA
-            )
-        )
+        row = {"tree_oid": tree_oid, "selection": selection, "file_count": len(files)}
+        await self._trees.add(pa.Table.from_pylist([row], schema=_TREES_SCHEMA))
 
-    async def load_tree(self, tree_oid: str) -> list[TreeFile]:
+    async def load_tree(self, tree_oid: str, selection: str) -> list[TreeFile]:
         rows = await self._rows(
-            self._tree_files, f"tree_oid = {_sql_str(tree_oid)}", ["path", "blob_oid", "language"]
+            self._tree_files,
+            self._tree_where(tree_oid, selection),
+            ["path", "blob_oid", "language"],
         )
         return sorted((TreeFile(**r) for r in rows), key=lambda f: f.path)
 
