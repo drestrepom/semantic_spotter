@@ -212,6 +212,26 @@ def test_check_staged_sees_index(check_repo):
     assert group["clone_type"] == 1
 
 
+def test_check_staged_first_commit(tmp_path, fake_embedder, monkeypatch):
+    monkeypatch.setattr(cli, "DIM", fake_embedder.dim)
+    repo = tmp_path / "nuevo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / "a").mkdir()
+    (repo / "a/a.go").write_text(LONG.format(pkg="a", name="PendingIDs", status="pending"))
+    git(repo, "add", "-A")
+    # Sin HEAD, la base es el árbol vacío: todo lo stageado es nuevo.
+    result = _check(repo, "--staged", "--structural")
+    assert result.exit_code == 0, result.output
+    assert "2 snippets cambiados" in _plain(result.stderr)
+
+    (repo / "b").mkdir()
+    (repo / "b/b.go").write_text(LONG.format(pkg="b", name="ShippedIDs", status="shipped"))
+    git(repo, "add", "-A")
+    result = _check(repo, "--staged", "--structural")
+    assert result.exit_code == 1, result.output
+
+
 def test_check_fail_on_and_semantic_warnings(check_repo, make_repo, fake_embedder):
     make_repo({"b/b.go": TWEAKED.format(pkg="b", name="PendingIDs", status="pending")})
     # Casi idéntico (T3): falla por defecto, no con --fail-on t1.

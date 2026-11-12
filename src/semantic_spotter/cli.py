@@ -438,24 +438,31 @@ async def _check(
 ) -> int:
     try:
         repo = await gitsource.repo_root(path)
-        head_sha = await gitsource.resolve_rev(repo, "HEAD")
-        base_sha = await gitsource.merge_base(repo, base, head_sha)
+        head_sha = await gitsource.head_commit(repo)
+        if head_sha is not None:
+            base_sha = await gitsource.merge_base(repo, base, head_sha)
+            base_tree, base_label = await gitsource.tree_of(repo, base_sha), base_sha[:12]
+        elif staged:
+            # Primer commit: no hay base, todo lo stageado es nuevo.
+            base_tree, base_label = await gitsource.empty_tree(repo), "el árbol vacío"
+        else:
+            raise gitsource.GitError("el repo todavía no tiene commits")
         head_tree = (
-            await gitsource.staged_tree(repo) if staged else await gitsource.tree_of(repo, head_sha)
+            await gitsource.staged_tree(repo) if staged else await gitsource.tree_of(repo, "HEAD")
         )
     except gitsource.GitError as exc:
         raise _git_error(exc) from exc
     store = await _open_store(repo, embed.model)
-    head_label = "index" if staged else head_sha[:12]
-    with err.status(f"Extrayendo snippets de {base_sha[:12]} y {head_label}…"):
-        base_snippets = await index_commit(store, repo, base_sha, options)
+    head_label = "index" if staged else (head_sha or "")[:12]
+    with err.status(f"Extrayendo snippets de {base_label} y {head_label}…"):
+        base_snippets = await index_tree(store, repo, base_tree, options)
         head_snippets = await index_tree(store, repo, head_tree, options)
     path_filter = await load_path_filter(repo, head_tree, exclude)
     base_snippets = apply_path_filter(base_snippets, path_filter)
     snippets = apply_path_filter(head_snippets, path_filter)
     queries = changed_occurrences(base_snippets, snippets)
     err.print(
-        f"{len(queries)} snippets cambiados en {head_label} respecto de {base_sha[:12]} "
+        f"{len(queries)} snippets cambiados en {head_label} respecto de {base_label} "
         f"({len(snippets)} en total)"
     )
 

@@ -59,6 +59,19 @@ async def resolve_rev(repo: Path, rev: str) -> str:
     return (await _git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")).decode().strip()
 
 
+async def head_commit(repo: Path) -> str | None:
+    """Commit de HEAD, o None si el repo (ya validado) todavía no tiene commits."""
+    try:
+        return await resolve_rev(repo, "HEAD")
+    except GitError:
+        return None
+
+
+async def empty_tree(repo: Path) -> str:
+    """Oid del árbol vacío en el formato de hash del repo (SHA-1 o SHA-256)."""
+    return (await _git(repo, "hash-object", "-t", "tree", "--stdin", stdin=b"")).decode().strip()
+
+
 async def tree_of(repo: Path, rev: str) -> str:
     return (await _git(repo, "rev-parse", "--verify", f"{rev}^{{tree}}")).decode().strip()
 
