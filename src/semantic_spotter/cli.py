@@ -1,10 +1,10 @@
 import asyncio
 import json
 import os
-from collections.abc import Sequence
+from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 import voyageai
@@ -120,6 +120,25 @@ def _git_error(exc: gitsource.GitError) -> typer.Exit:
     return typer.Exit(2)
 
 
+def _run[T](command: Coroutine[Any, Any, T]) -> T:
+    """Corre el comando; un error de la herramienta sale con 2, nunca con 1.
+
+    El 1 queda para `check` cuando encuentra clones de `--fail-on`, así quien
+    lo llama (el hook) no confunde un bug con un duplicado.
+    """
+    try:
+        return asyncio.run(command)
+    except typer.Exit:
+        raise
+    except typer.Abort as exc:
+        err.print("[red]Cancelado.[/]")
+        raise typer.Exit(2) from exc
+    except Exception as exc:
+        err.print_exception()
+        err.print(f"[red]Error de semantic-spotter ({type(exc).__name__}):[/] {exc}")
+        raise typer.Exit(2) from exc
+
+
 async def _ensure_embeddings(
     store: Store,
     repo: Path,
@@ -165,7 +184,7 @@ async def _ensure_embeddings(
     except voyageai.error.VoyageError as exc:
         err.print(f"[red]Error de Voyage ({type(exc).__name__}):[/] {exc}")
         err.print(f"Se guardaron {done} embeddings; vuelve a correr para continuar.")
-        raise typer.Exit(1) from exc
+        raise typer.Exit(2) from exc
     return True
 
 
@@ -219,7 +238,7 @@ def scan(
     as_json: JsonOpt = False,
 ) -> None:
     """Busca clones en todo el árbol de un commit."""
-    asyncio.run(
+    _run(
         _scan(
             path=path,
             rev=rev,
@@ -368,7 +387,7 @@ def check(
     as_json: JsonOpt = False,
 ) -> None:
     """Busca duplicados solo de los snippets que cambiaron respecto de la base."""
-    code = asyncio.run(
+    code = _run(
         _check(
             path=path,
             base=base or ("HEAD" if staged else "main"),
@@ -447,7 +466,7 @@ async def _check(
     pairs = classify_pairs(snippets, suppress_subsumed(snippets, pairs), t3_jaccard=t3_jaccard)
     changed = set(queries)
     groups = _drop_ignored(snippets, group_pairs(snippets, pairs, max_group=max_group), changed)
-    seen =await store.first_seen(_members(snippets, groups), options.key)
+    seen = await store.first_seen(_members(snippets, groups), options.key)
     if as_json:
         report = groups_to_json(snippets, groups, changed, seen)
         print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -481,7 +500,7 @@ def index(
     min_block_lines: MinBlockLinesOpt = 6,
 ) -> None:
     """Recorre el historial para saber en qué commit apareció cada snippet. No usa Voyage."""
-    asyncio.run(
+    _run(
         _index(
             path=path,
             rev=rev,

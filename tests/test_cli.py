@@ -5,6 +5,7 @@ import subprocess
 import sys
 
 import pytest
+import voyageai
 from typer.testing import CliRunner
 
 from conftest import count_extractions, git
@@ -231,6 +232,31 @@ def test_check_without_api_key_skips_t4(check_repo, make_repo, monkeypatch, fake
     assert result.exit_code == 1, result.output
     assert "se omiten los clones semánticos" in result.stderr
     assert fake_embedder.embedded == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "confirm",  # sin TTY, la confirmación de tokens aborta
+        voyageai.error.RateLimitError("cuota agotada"),
+        RuntimeError("bug"),
+    ],
+    ids=["confirm-aborta", "voyage", "inesperado"],
+)
+def test_check_tool_errors_exit_2(check_repo, make_repo, fake_embedder, monkeypatch, failure):
+    make_repo({"b/b.go": LONG.format(pkg="b", name="ShippedIDs", status="shipped")})
+    args = []
+    if failure == "confirm":
+        args = ["--max-tokens-without-confirm", "0"]
+    else:
+
+        async def embed(texts):
+            raise failure
+
+        monkeypatch.setattr(fake_embedder, "embed", embed)
+    result = _check(check_repo, *args)
+    # 1 queda solo para grupos que fallan por --fail-on.
+    assert result.exit_code == 2, result.output
 
 
 def test_index_then_check_shows_first_seen(check_repo, make_repo):
