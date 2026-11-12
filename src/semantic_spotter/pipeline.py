@@ -16,7 +16,7 @@ from semantic_spotter.store import ExtractedBlob, Sighting, Store
 
 
 # Sube cuando cambia lo que se extrae por snippet, para forzar la re-extracción.
-EXTRACT_VERSION = 3
+EXTRACT_VERSION = 4
 
 
 @dataclass(frozen=True)

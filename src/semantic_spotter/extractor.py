@@ -1,4 +1,5 @@
 import hashlib
+import re
 import textwrap
 
 from tree_sitter import Node
@@ -7,6 +8,41 @@ from semantic_spotter.languages import LanguageSpec
 from semantic_spotter.models import Snippet, Unit
 
 SHINGLE_SIZE = 5
+
+# `// semantic-spotter:ignore -- <motivo>` (o `/* … */`); sin motivo no cuenta.
+_IGNORE_MARK = re.compile(
+    r"^(?://|/\*)\s*semantic-spotter:ignore\s+--\s*(?P<reason>.*?)\s*(?:\*/)?\s*$", re.DOTALL
+)
+
+
+def ignore_reason(node: Node) -> str:
+    """Motivo de la marca de ignorar del comentario inmediatamente anterior al nodo.
+
+    El comentario es hermano de la declaración que empieza en la misma línea que
+    el nodo (`export function`, `const f = () =>`), queda fuera de su rango de
+    bytes y no puede tener líneas ni código entre medio. "" si no hay marca válida.
+    """
+    anchor = node
+    while (
+        anchor.parent is not None
+        and anchor.parent.parent is not None
+        and anchor.parent.start_point.row == anchor.start_point.row
+    ):
+        anchor = anchor.parent
+    comment = anchor.prev_sibling
+    if (
+        comment is None
+        or comment.type != "comment"
+        or anchor.start_point.row - comment.end_point.row > 1
+    ):
+        return ""
+    # Un comentario al final de una línea de código no marca la línea siguiente.
+    before = comment.prev_sibling
+    if before is not None and before.end_point.row == comment.start_point.row:
+        return ""
+    text = (comment.text or b"").decode("utf-8", "replace")
+    match = _IGNORE_MARK.match(text)
+    return match["reason"] if match else ""
 
 
 def snippet_text(source: bytes, start_byte: int, end_byte: int) -> str:
@@ -78,7 +114,9 @@ def extract(
     tree = spec.parser().parse(source)
     snippets: list[Snippet] = []
 
-    def emit(node: Node, unit: Unit, kind: str, name: str, min_lines: int) -> None:
+    def emit(
+        node: Node, unit: Unit, kind: str, name: str, min_lines: int, reason: str
+    ) -> None:
         text = snippet_text(source, node.start_byte, node.end_byte)
         if _non_empty_lines(text) < min_lines:
             return
@@ -98,18 +136,21 @@ def extract(
                 end_byte=node.end_byte,
                 norm_hash=content_hash(" ".join(tokens)) if fingerprint else "",
                 shingles=shingles(tokens) if fingerprint else (),
+                ignore_reason=reason,
             )
         )
 
     # Recorrido iterativo en orden de fuente; `enclosing` es la función con
-    # nombre más cercana, usada para nombrar los bloques.
-    stack: list[tuple[Node, str | None]] = [(tree.root_node, None)]
+    # nombre más cercana, usada para nombrar los bloques, y `inherited` el
+    # motivo de la marca de ignorar del contenedor más cercano que la tenga.
+    stack: list[tuple[Node, str | None, str]] = [(tree.root_node, None, "")]
     while stack:
-        node, enclosing = stack.pop()
+        node, enclosing, inherited = stack.pop()
         func_name = spec.function_name(node)
         if func_name is not None:
             kind = "method" if "." in func_name else "func"
-            emit(node, "function", kind, func_name, min_func_lines)
+            inherited = ignore_reason(node) or inherited
+            emit(node, "function", kind, func_name, min_func_lines, inherited)
             enclosing = func_name
         elif node.type in spec.block_kinds and not (
             node.type == "if_statement"
@@ -119,7 +160,8 @@ def extract(
             kind = spec.block_kinds[node.type]
             line = node.start_point.row + 1
             name = f"{enclosing or '<top>'} › {kind}@L{line}"
-            emit(node, "block", kind, name, min_block_lines)
-        stack.extend((child, enclosing) for child in reversed(node.named_children))
+            inherited = ignore_reason(node) or inherited
+            emit(node, "block", kind, name, min_block_lines, inherited)
+        stack.extend((child, enclosing, inherited) for child in reversed(node.named_children))
 
     return snippets

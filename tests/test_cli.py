@@ -241,3 +241,169 @@ def test_index_then_check_shows_first_seen(check_repo, make_repo):
     first_seen = {m["file_path"]: m["first_seen"] for m in group["members"]}
     assert first_seen["a/a.go"]["commit"] == original
     assert first_seen["b/b.go"] is None  # el commit nuevo todavía no se recorrió
+
+
+# --- marca de ignorar ------------------------------------------------------------
+
+
+def _marked(source, marker="semantic-spotter:ignore -- adaptador temporal"):
+    """Pone `// <marker>` en la línea anterior a cada función del archivo."""
+    return source.replace("\nfunc ", f"\n// {marker}\nfunc ")
+
+
+def test_check_passes_marked_copy(check_repo, make_repo):
+    make_repo({"b/b.go": _marked(LONG.format(pkg="b", name="ShippedIDs", status="shipped"))})
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == []
+    assert "1 grupos omitidos por marca de ignorar" in _plain(result.stderr)
+
+
+@pytest.mark.parametrize(
+    "marker", ["semantic-spotter:ignore", "semantic-spotter:ignore --", "semantic-spotter:ignore --  "]
+)
+def test_check_mark_without_reason_does_not_count(check_repo, make_repo, marker):
+    copy = _marked(LONG.format(pkg="b", name="ShippedIDs", status="shipped"), marker)
+    make_repo({"b/b.go": copy})
+    assert _check(check_repo, "--structural").exit_code == 1
+
+
+def test_check_marking_existing_function_changes_nothing(check_repo, make_repo):
+    make_repo({"a/a.go": _marked(LONG.format(pkg="a", name="PendingIDs", status="pending"))})
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == 0, result.output
+    assert "0 snippets cambiados" in _plain(result.stderr)
+
+
+def test_check_mark_does_not_cover_new_copies(check_repo, make_repo):
+    make_repo({"a/a.go": _marked(LONG.format(pkg="a", name="PendingIDs", status="pending"))})
+    make_repo({"b/b.go": LONG.format(pkg="b", name="ShippedIDs", status="shipped")})
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == 1, result.output
+    [group] = json.loads(result.stdout)
+    assert {m["file_path"] for m in group["members"]} == {"a/a.go", "b/b.go"}
+
+
+def test_check_needs_every_changed_member_marked(check_repo, make_repo):
+    make_repo(
+        {
+            "b/b.go": _marked(LONG.format(pkg="b", name="ShippedIDs", status="shipped")),
+            "d/d.go": LONG.format(pkg="d", name="DoneIDs", status="done"),
+        }
+    )
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == 1, result.output
+    [group] = json.loads(result.stdout)
+    assert {m["file_path"] for m in group["members"]} == {"a/a.go", "b/b.go", "d/d.go"}
+
+
+# El `for` de LONG dentro de una función que por lo demás no se le parece.
+HOST = """package b
+
+func Summarize(orders []Order, limit int, w io.Writer) error {
+	if limit <= 0 {
+		return errors.New("limit")
+	}
+	total := 0
+	for _, o := range orders {
+		total += o.Amount
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, limit)
+	for _, o := range orders {
+		if o.Status != "pending" || seen[o.ID] {
+			continue
+		}
+		seen[o.ID] = true
+		out = append(out, o.ID)
+		if len(out) >= limit {
+			break
+		}
+	}
+	_, err := fmt.Fprintf(w, "%d %v", total, out)
+	return err
+}
+"""
+
+
+@pytest.mark.parametrize("marked", [False, True])
+def test_check_mark_covers_inner_blocks(check_repo, make_repo, marked):
+    make_repo({"b/b.go": _marked(HOST) if marked else HOST})
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == 0, result.output
+    groups = json.loads(result.stdout)
+    if marked:
+        assert groups == []
+    else:
+        # Sin marca, el `for` copiado se reporta como grupo de solo bloques.
+        [group] = groups
+        assert group["blocks_only"]
+        assert {m["file_path"] for m in group["members"]} == {"a/a.go", "b/b.go"}
+
+
+def test_check_mark_silences_t3_warning(check_repo, make_repo):
+    make_repo({"b/b.go": _marked(TWEAKED.format(pkg="b", name="PendingIDs", status="pending"))})
+    result = _check(check_repo, "--structural", "--t3-jaccard", "0.6", "--fail-on", "t1")
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == []
+
+
+TS_BODY = """
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const o of orders) {
+    if (o.status !== "pending" || seen.has(o.id)) {
+      continue;
+    }
+    seen.add(o.id);
+    out.push(o.id);
+    if (out.length >= limit) {
+      break;
+    }
+  }
+  return out;
+"""
+TS_MARK = "// semantic-spotter:ignore -- variantes por tipo de orden\n"
+
+
+@pytest.mark.parametrize("marked", [False, True])
+def test_check_mark_in_typescript(check_repo, make_repo, marked):
+    mark = TS_MARK if marked else ""
+    signature = "(orders: Order[], limit: number): string[]"
+    make_repo(
+        {
+            "t/a.ts": f"{mark}export function pendingIds{signature} {{{TS_BODY}}}\n",
+            "t/b.ts": f"{mark}export const shippedIds = {signature} => {{{TS_BODY}}};\n",
+            "t/c.ts": f"export class Repo {{\n  {mark}  ids{signature} {{{TS_BODY}}}\n}}\n",
+        }
+    )
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == (0 if marked else 1), result.output
+
+
+def test_check_failure_explains_both_ways_out(check_repo, make_repo):
+    make_repo({"b/b.go": LONG.format(pkg="b", name="ShippedIDs", status="shipped")})
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == 1, result.output
+    stderr = " ".join(_plain(result.stderr).split())
+    assert "extrae la lógica compartida" in stderr
+    assert "// semantic-spotter:ignore -- <motivo>" in stderr
+
+
+def test_scan_omits_groups_with_every_member_marked(repo, make_repo):
+    make_repo(
+        {
+            "a/a.go": _marked(FUNC.format(pkg="a", name="CountItems")),
+            "b/b.go": _marked(FUNC.format(pkg="b", name="Tally")),
+        }
+    )
+    args = ["scan", str(repo), "--json", "--threshold", "0.8"]
+    result = CliRunner().invoke(cli.app, args)
+    assert result.exit_code == 0, result.output
+    [group] = json.loads(result.stdout)
+    assert len(group["members"]) == 3
+
+    make_repo({"mig/x/main.go": _marked(FUNC.format(pkg="main", name="Count"))})
+    result = CliRunner().invoke(cli.app, args)
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == []

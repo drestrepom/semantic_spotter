@@ -19,7 +19,7 @@ DB_DIRNAME = ".semantic-spotter"
 
 # Ningún esquema guarda el texto de los snippets: se recupera de los blobs de git.
 # El sufijo cambia cuando cambia el esquema; las tablas viejas quedan sin uso.
-_SUFFIX = "_v3"
+_SUFFIX = "_v4"
 
 # commit → árbol: registra que el commit se analizó.
 _COMMITS_SCHEMA = pa.schema(
@@ -48,7 +48,8 @@ _BLOBS_SCHEMA = pa.schema(
         pa.field("snippet_count", pa.int64()),
     ]
 )
-# Ubicación de cada snippet dentro de su blob.
+# Ubicación de cada snippet dentro de su blob, con el motivo de su marca de
+# ignorar efectiva ("" sin marca); es el único texto del código que se guarda.
 _BLOB_SNIPPETS_SCHEMA = pa.schema(
     [
         pa.field("blob_oid", pa.string()),
@@ -62,6 +63,7 @@ _BLOB_SNIPPETS_SCHEMA = pa.schema(
         pa.field("end_line", pa.int32()),
         pa.field("start_byte", pa.int64()),
         pa.field("end_byte", pa.int64()),
+        pa.field("ignore_reason", pa.string()),
     ]
 )
 # Huella estructural por contenido; `normalizer` versiona la normalización.
