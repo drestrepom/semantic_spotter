@@ -351,8 +351,13 @@ class Store:
         if not blobs:
             return
         key = f"extract_key = {_sql_str(extract_key)}"
-        for chunk in _chunks(sorted({b.blob_oid for b in blobs})):
-            await self._blob_snippets.delete(f"{key} AND {_in('blob_oid', chunk)}")
+        # Por (blob, lenguaje): el mismo blob como .ts y .tsx son dos extracciones.
+        oids_by_language: dict[str, set[str]] = defaultdict(set)
+        for b in blobs:
+            oids_by_language[b.language].add(b.blob_oid)
+        for language, oids in oids_by_language.items():
+            for where in _narrowed(f"{key} AND language = {_sql_str(language)}", "blob_oid", oids):
+                await self._blob_snippets.delete(where)
         locations = [
             {
                 "blob_oid": b.blob_oid,

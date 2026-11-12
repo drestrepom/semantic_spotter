@@ -456,6 +456,17 @@ def test_check_mark_in_typescript(check_repo, make_repo, marked):
     assert result.exit_code == (0 if marked else 1), result.output
 
 
+def test_check_same_blob_as_ts_and_tsx(check_repo, make_repo):
+    source = f"export function pendingIds(orders: Order[], limit: number): string[] {{{TS_BODY}}}\n"
+    make_repo({"t/a.ts": source})
+    # La copia como .tsx es el mismo blob, extraído con otro lenguaje.
+    make_repo({"t/b.tsx": source})
+    result = _check(check_repo, "--structural", "--base", "HEAD~1")
+    assert result.exit_code == 1, result.output
+    [group] = json.loads(result.stdout)
+    assert {m["file_path"] for m in group["members"]} == {"t/a.ts", "t/b.tsx"}
+
+
 def test_check_failure_explains_both_ways_out(check_repo, make_repo):
     make_repo({"b/b.go": LONG.format(pkg="b", name="ShippedIDs", status="shipped")})
     result = _check(check_repo, "--structural")
