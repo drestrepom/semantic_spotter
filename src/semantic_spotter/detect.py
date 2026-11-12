@@ -6,7 +6,6 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from semantic_spotter.extractor import SHINGLE_SIZE
 from semantic_spotter.models import Snippet
 
 _CHUNK_ROWS = 2048
@@ -147,10 +146,9 @@ def renamed_pairs(
     renombrado. Se ignoran unidades de menos de `min_tokens` tokens, que suelen
     coincidir por pura forma (getters, delegaciones).
     """
-    min_shingles = max(1, min_tokens - SHINGLE_SIZE + 1)
     classes: dict[str, list[int]] = defaultdict(list)
     for i, s in enumerate(snippets):
-        if s.norm_hash and len(s.shingles) >= min_shingles:
+        if s.norm_hash and s.token_count >= min_tokens:
             classes[s.norm_hash].append(i)
     m = _normalize(matrix.astype(np.float32))
     pairs: list[Pair] = []
@@ -228,8 +226,7 @@ def structural_pairs(
     solo entre unidades de al menos `min_tokens` tokens (ver `renamed_pairs`).
     El score es el coseno si hay matriz y, si no, el Jaccard.
     """
-    min_shingles = max(1, min_tokens - SHINGLE_SIZE + 1)
-    eligible = [i for i, s in enumerate(snippets) if len(s.shingles) >= min_shingles]
+    eligible = [i for i, s in enumerate(snippets) if s.token_count >= min_tokens]
     eligible_set = set(eligible)
     by_hash: dict[str, list[int]] = defaultdict(list)
     by_norm: dict[str, list[int]] = defaultdict(list)

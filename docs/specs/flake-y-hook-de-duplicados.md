@@ -111,7 +111,7 @@ Hoy, además:
 
 - La ruta por defecto del índice pasa a ser `<directorio común de git>/semantic-spotter/` (resultado de `git rev-parse --git-common-dir`, resuelto respecto del repo). Es el mismo para todos los worktrees.
 - `SEMANTIC_SPOTTER_DB`, si está definida, la reemplaza.
-- Ya no se crea `.semantic-spotter/` en la raíz del worktree ni su `.gitignore` interno (dentro de `.git/` no hace falta).
+- Ya no se crea `.semantic-spotter/` en la raíz del worktree. El índice lleva siempre un `.gitignore` con `*`, por si `SEMANTIC_SPOTTER_DB` lo pone dentro de un worktree; una ruta relativa en esa variable se resuelve contra el repo.
 - Las escrituras se serializan con un lock exclusivo de archivo (`flock`) sobre un archivo dentro del directorio del índice. Las lecturas no toman el lock; la consistencia de lectura ya es fuerte.
 - El lock cubre cada operación de escritura completa (registrar un árbol, guardar blobs extraídos, guardar historia, guardar embeddings). Antes de extraer, tras tomar el lock, se vuelve a consultar qué blobs faltan, para no re-extraer lo que otro proceso acaba de guardar.
 - Las escrituras son idempotentes: el mismo blob con la misma clave de extracción siempre produce las mismas filas, y el patrón borrar-y-agregar por blob se mantiene.

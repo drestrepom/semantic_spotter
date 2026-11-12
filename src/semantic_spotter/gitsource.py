@@ -7,7 +7,8 @@ _NOISE_DIRS = frozenset({"vendor", "node_modules"})
 _GENERATED_SUFFIXES = (".d.ts", ".pb.go")
 _TEST_PATTERNS = re.compile(r"(_test\.go|\.(test|spec)\.[cm]?tsx?)$")
 # Convención de Go (y de muchos generadores TS): https://go.dev/s/generatedcode
-_GENERATED_HEADER = re.compile(rb"^// Code generated .* DO NOT EDIT\.$", re.MULTILINE)
+# `\r?` porque con MULTILINE `$` no acepta el fin de línea CRLF.
+_GENERATED_HEADER = re.compile(rb"^// Code generated .* DO NOT EDIT\.\r?$", re.MULTILINE)
 
 
 class GitError(RuntimeError):
@@ -57,6 +58,19 @@ async def common_dir(repo: Path) -> Path:
 
 async def resolve_rev(repo: Path, rev: str) -> str:
     return (await _git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}")).decode().strip()
+
+
+async def head_commit(repo: Path) -> str | None:
+    """Commit de HEAD, o None si el repo (ya validado) todavía no tiene commits."""
+    try:
+        return await resolve_rev(repo, "HEAD")
+    except GitError:
+        return None
+
+
+async def empty_tree(repo: Path) -> str:
+    """Oid del árbol vacío en el formato de hash del repo (SHA-1 o SHA-256)."""
+    return (await _git(repo, "hash-object", "-t", "tree", "--stdin", stdin=b"")).decode().strip()
 
 
 async def tree_of(repo: Path, rev: str) -> str:

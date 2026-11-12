@@ -1,10 +1,10 @@
 import asyncio
 import json
 import os
-from collections.abc import Sequence
+from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 import voyageai
@@ -40,7 +40,7 @@ from semantic_spotter.pipeline import (
     run_embeddings,
 )
 from semantic_spotter.report import groups_to_json, pairs_to_json, print_groups, print_pairs
-from semantic_spotter.store import Store
+from semantic_spotter.store import IndexBusy, Store
 
 DEFAULT_MODEL = "voyage-code-4"
 DIM = 1024
@@ -112,12 +112,41 @@ def make_embedder(model: str) -> Embedder:
 async def _open_store(repo: Path, model: str) -> Store:
     load_dotenv(find_dotenv(usecwd=True))
     load_dotenv(repo / ".env")
-    return await Store.open(repo, model, DIM)
+    return await Store.open(
+        repo,
+        model,
+        DIM,
+        on_lock_wait=lambda: err.print(
+            "Esperando a que otro proceso termine de escribir el índice…"
+        ),
+    )
 
 
 def _git_error(exc: gitsource.GitError) -> typer.Exit:
     err.print(f"[red]Error de git:[/] {exc}")
     return typer.Exit(2)
+
+
+def _run[T](command: Coroutine[Any, Any, T]) -> T:
+    """Corre el comando; un error de la herramienta sale con 2, nunca con 1.
+
+    El 1 queda para `check` cuando encuentra clones de `--fail-on`, así quien
+    lo llama (el hook) no confunde un bug con un duplicado.
+    """
+    try:
+        return asyncio.run(command)
+    except typer.Exit:
+        raise
+    except typer.Abort as exc:
+        err.print("[red]Cancelado.[/]")
+        raise typer.Exit(2) from exc
+    except IndexBusy as exc:
+        err.print(f"[red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    except Exception as exc:
+        err.print_exception()
+        err.print(f"[red]Error de semantic-spotter ({type(exc).__name__}):[/] {exc}")
+        raise typer.Exit(2) from exc
 
 
 async def _ensure_embeddings(
@@ -127,6 +156,7 @@ async def _ensure_embeddings(
     settings: EmbedSettings,
     *,
     dry_run: bool = False,
+    missing: Sequence[str] | None = None,
 ) -> bool:
     """Embebe los hashes que faltan; False si es `dry_run` y no se embebió."""
     embedder: Embedder | None = None
@@ -138,7 +168,7 @@ async def _ensure_embeddings(
         return embedder
 
     with err.status("Contando tokens de snippets nuevos…"):
-        plan = await plan_embeddings(store, repo, snippets, get_embedder)
+        plan = await plan_embeddings(store, repo, snippets, get_embedder, missing)
     err.print(f"{len(plan.hashes)} snippets sin embedding · ~{plan.total_tokens:,} tokens")
     if dry_run:
         return False
@@ -165,7 +195,7 @@ async def _ensure_embeddings(
     except voyageai.error.VoyageError as exc:
         err.print(f"[red]Error de Voyage ({type(exc).__name__}):[/] {exc}")
         err.print(f"Se guardaron {done} embeddings; vuelve a correr para continuar.")
-        raise typer.Exit(1) from exc
+        raise typer.Exit(2) from exc
     return True
 
 
@@ -219,7 +249,7 @@ def scan(
     as_json: JsonOpt = False,
 ) -> None:
     """Busca clones en todo el árbol de un commit."""
-    asyncio.run(
+    _run(
         _scan(
             path=path,
             rev=rev,
@@ -368,7 +398,7 @@ def check(
     as_json: JsonOpt = False,
 ) -> None:
     """Busca duplicados solo de los snippets que cambiaron respecto de la base."""
-    code = asyncio.run(
+    code = _run(
         _check(
             path=path,
             base=base or ("HEAD" if staged else "main"),
@@ -408,26 +438,31 @@ async def _check(
 ) -> int:
     try:
         repo = await gitsource.repo_root(path)
-        head_sha = await gitsource.resolve_rev(repo, "HEAD")
-        base_sha = await gitsource.merge_base(repo, base, head_sha)
+        head_sha = await gitsource.head_commit(repo)
+        if head_sha is not None:
+            base_sha = await gitsource.merge_base(repo, base, head_sha)
+            base_tree, base_label = await gitsource.tree_of(repo, base_sha), base_sha[:12]
+        elif staged:
+            # Primer commit: no hay base, todo lo stageado es nuevo.
+            base_tree, base_label = await gitsource.empty_tree(repo), "el árbol vacío"
+        else:
+            raise gitsource.GitError("el repo todavía no tiene commits")
         head_tree = (
-            await gitsource.staged_tree(repo) if staged else await gitsource.tree_of(repo, head_sha)
+            await gitsource.staged_tree(repo) if staged else await gitsource.tree_of(repo, "HEAD")
         )
     except gitsource.GitError as exc:
         raise _git_error(exc) from exc
     store = await _open_store(repo, embed.model)
-    head_label = "index" if staged else head_sha[:12]
-    with err.status(f"Extrayendo snippets de {base_sha[:12]} y {head_label}…"):
-        base_snippets = await index_commit(store, repo, base_sha, options)
-        if not staged:
-            await store.link_commit(head_sha, head_tree)
+    head_label = "index" if staged else (head_sha or "")[:12]
+    with err.status(f"Extrayendo snippets de {base_label} y {head_label}…"):
+        base_snippets = await index_tree(store, repo, base_tree, options)
         head_snippets = await index_tree(store, repo, head_tree, options)
     path_filter = await load_path_filter(repo, head_tree, exclude)
     base_snippets = apply_path_filter(base_snippets, path_filter)
     snippets = apply_path_filter(head_snippets, path_filter)
     queries = changed_occurrences(base_snippets, snippets)
     err.print(
-        f"{len(queries)} snippets cambiados en {head_label} respecto de {base_sha[:12]} "
+        f"{len(queries)} snippets cambiados en {head_label} respecto de {base_label} "
         f"({len(snippets)} en total)"
     )
 
@@ -437,7 +472,7 @@ async def _check(
         if missing and _api_key() is None:
             err.print("[yellow]Sin VOYAGE_API_KEY: se omiten los clones semánticos (T4).[/]")
         else:
-            await _ensure_embeddings(store, repo, snippets, embed)
+            await _ensure_embeddings(store, repo, snippets, embed, missing=missing)
             matrix = await store.load_vectors([s.content_hash for s in snippets])
 
     pairs = structural_pairs(snippets, queries, matrix, t3_jaccard=t3_jaccard)
@@ -446,7 +481,7 @@ async def _check(
     pairs = classify_pairs(snippets, suppress_subsumed(snippets, pairs), t3_jaccard=t3_jaccard)
     changed = set(queries)
     groups = _drop_ignored(snippets, group_pairs(snippets, pairs, max_group=max_group), changed)
-    seen =await store.first_seen(_members(snippets, groups), options.key)
+    seen = await store.first_seen(_members(snippets, groups), options.key)
     if as_json:
         report = groups_to_json(snippets, groups, changed, seen)
         print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -480,7 +515,7 @@ def index(
     min_block_lines: MinBlockLinesOpt = 6,
 ) -> None:
     """Recorre el historial para saber en qué commit apareció cada snippet. No usa Voyage."""
-    asyncio.run(
+    _run(
         _index(
             path=path,
             rev=rev,

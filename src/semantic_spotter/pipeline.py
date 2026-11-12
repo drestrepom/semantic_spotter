@@ -16,7 +16,10 @@ from semantic_spotter.store import ExtractedBlob, Sighting, Store
 
 
 # Sube cuando cambia lo que se extrae por snippet, para forzar la re-extracción.
-EXTRACT_VERSION = 4
+EXTRACT_VERSION = 5
+# Sube cuando cambian las reglas que eligen los archivos de un árbol (extensiones,
+# directorios de ruido, sufijos generados), para volver a listar los ya registrados.
+SELECT_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -57,14 +60,16 @@ def _extract_blob(file: TreeFile, source: bytes, options: ExtractOptions) -> Ext
 
 async def tree_files(store: Store, repo: Path, tree_oid: str) -> list[TreeFile]:
     """Archivos de lenguajes soportados del árbol; se registran la primera vez."""
-    if await store.has_tree(tree_oid):
-        return await store.load_tree(tree_oid)
+    selection = f"s{SELECT_VERSION}"
+    if await store.has_tree(tree_oid, selection):
+        return await store.load_tree(tree_oid, selection)
     files = [
         TreeFile(f.path, f.oid, spec.name)
         for f in await gitsource.list_files(repo, tree_oid)
         if (spec := spec_for(f.path)) and gitsource.is_candidate(f.path, include_tests=True)
     ]
-    await store.save_tree(tree_oid, files)
+    async with store.writing():
+        await store.save_tree(tree_oid, selection, files)
     return files
 
 
@@ -97,10 +102,8 @@ async def index_tree(
 async def index_commit(
     store: Store, repo: Path, sha: str, options: ExtractOptions
 ) -> list[Snippet]:
-    """Registra que el commit se analizó y devuelve los snippets de su árbol."""
-    tree_oid = await gitsource.tree_of(repo, sha)
-    await store.link_commit(sha, tree_oid)
-    return await index_tree(store, repo, tree_oid, options)
+    """Snippets del árbol del commit."""
+    return await index_tree(store, repo, await gitsource.tree_of(repo, sha), options)
 
 
 # Commits por lote al recorrer el historial: cada lote lee sus blobs con un solo
@@ -133,7 +136,7 @@ async def index_history(
     commits = await gitsource.history(repo, rev, since)
     walked = await store.walked_commits(options.key)
     todo = [c for c in commits if c.sha not in walked]
-    seen = await store.seen_keys(options.key)
+    seen = {k: x.committed_at for k, x in (await store.sightings(options.key)).items()}
     hashes: dict[tuple[str, str], list[str]] = {}
     sightings_total = 0
     for start in range(0, len(todo), _HISTORY_BATCH):
@@ -167,11 +170,16 @@ async def index_history(
             for f in c.changed:
                 spec = spec_for(f.path)
                 for h in hashes.get((f.oid, spec.name), []) if spec else []:
-                    if (f.path, h) not in seen:
-                        seen.add((f.path, h))
+                    # Un commit más antiguo puede recorrerse después (`--since` y luego
+                    # todo, o ramas paralelas): su avistamiento reemplaza al conocido.
+                    known = seen.get((f.path, h))
+                    if known is None or c.committed_at < known:
+                        seen[(f.path, h)] = c.committed_at
                         sightings.append(Sighting(f.path, h, c.sha, c.committed_at))
-        await store.save_history(options.key, [(c.sha, c.committed_at) for c in batch], sightings)
-        sightings_total += len(sightings)
+        async with store.writing():
+            sightings_total += await store.save_history(
+                options.key, [(c.sha, c.committed_at) for c in batch], sightings
+            )
         if on_batch is not None:
             on_batch(start + len(batch), len(todo))
     return HistoryStats(len(commits), len(todo), len(hashes), sightings_total)
@@ -209,16 +217,18 @@ async def plan_embeddings(
     repo: Path,
     snippets: Sequence[Snippet],
     embedder_factory: Callable[[], Embedder],
+    missing: Sequence[str] | None = None,
 ) -> EmbeddingPlan:
     """Hashes que todavía no tienen embedding en caché, con su texto leído de git.
 
-    El embedder solo se construye si falta algo, así un re-escaneo sin cambios
-    no necesita API key ni descarga el tokenizer.
+    `missing` evita volver a consultarlos si quien llama ya lo hizo. El embedder
+    solo se construye si falta algo, así un re-escaneo sin cambios no necesita
+    API key ni descarga el tokenizer.
     """
     occurrence: dict[str, Snippet] = {}
     for s in snippets:
         occurrence.setdefault(s.content_hash, s)
-    missing = await store.missing_hashes(list(occurrence))
+    missing = list(missing) if missing is not None else await store.missing_hashes(list(occurrence))
     if not missing:
         return EmbeddingPlan([], [], [])
     sources = await gitsource.read_blobs(repo, sorted({occurrence[h].blob_oid for h in missing}))
@@ -300,7 +310,8 @@ async def run_embeddings(
         for done in asyncio.as_completed(tasks):
             batch, vectors = await done
             # Las escrituras se serializan aquí; lo ya persistido sobrevive a un fallo.
-            await store.add_embeddings([plan.hashes[i] for i in batch], vectors)
+            async with store.writing():
+                await store.add_embeddings([plan.hashes[i] for i in batch], vectors)
             if on_batch is not None:
                 on_batch(len(batch))
     finally:

@@ -1,6 +1,8 @@
+import asyncio
+
 from conftest import count_extractions
 
-from semantic_spotter import pipeline
+from semantic_spotter import gitsource, pipeline
 from semantic_spotter.pipeline import (
     EmbeddingPlan,
     ExtractOptions,
@@ -154,3 +156,26 @@ async def test_index_history_records_first_sighting(make_repo, fake_embedder):
     # Una segunda corrida no vuelve a recorrer nada.
     again = await index_history(store, repo, "HEAD", None, options)
     assert again.walked == 0 and again.sightings == 0
+
+
+async def test_concurrent_index_history_writes_sightings_once(
+    make_repo, fake_embedder, monkeypatch
+):
+    repo, _ = make_repo({"a.go": GO_A})
+    make_repo({"b.go": GO_A.replace("Sum", "Total")})
+    # Las dos corridas leen qué falta antes de que cualquiera escriba.
+    barrier = asyncio.Barrier(2)
+    read_blobs = gitsource.read_blobs
+
+    async def read_after_both(*args):
+        await barrier.wait()
+        return await read_blobs(*args)
+
+    monkeypatch.setattr(gitsource, "read_blobs", read_after_both)
+    stores = [await Store.open(repo, fake_embedder.model, fake_embedder.dim) for _ in range(2)]
+    stats = await asyncio.gather(
+        *(index_history(s, repo, "HEAD", None, ExtractOptions()) for s in stores)
+    )
+    # La que tomó el lock segunda encuentra todo escrito: no agrega nada.
+    assert sorted(s.sightings for s in stats)[0] == 0
+    assert sorted(s.sightings for s in stats)[1] > 0
