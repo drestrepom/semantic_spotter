@@ -2,7 +2,6 @@ from collections.abc import Iterator, Sequence
 from typing import Protocol
 
 import numpy as np
-import voyageai
 
 # Límites de la API de Voyage por request (120K es el tope más conservador publicado).
 MAX_BATCH_TEXTS = 1000
@@ -49,6 +48,9 @@ class VoyageEmbedder:
     ) -> None:
         self.model = model
         self.dim = dim
+        # Import diferido: cuesta ~0.2 s y `check --structural` no lo usa.
+        import voyageai
+
         # El cliente reintenta con backoff exponencial ante rate limits.
         self._client = voyageai.AsyncClient(api_key=api_key, max_retries=max_retries)
 

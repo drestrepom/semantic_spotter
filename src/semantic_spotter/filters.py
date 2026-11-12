@@ -41,11 +41,19 @@ class PathFilter:
 
     def __init__(self, patterns: Iterable[str]) -> None:
         self._rules = [rule for p in patterns if (rule := _compile(p)) is not None]
+        # Hay miles de snippets por ruta: cada ruta se evalúa una sola vez.
+        self._cache: dict[str, bool] = {}
 
     def __bool__(self) -> bool:
         return bool(self._rules)
 
     def excluded(self, path: str) -> bool:
+        if (cached := self._cache.get(path)) is not None:
+            return cached
+        result = self._cache[path] = self._match(path)
+        return result
+
+    def _match(self, path: str) -> bool:
         target = PurePosixPath(path)
         # Un patrón que nombra un directorio excluye todo lo que hay debajo.
         directories = [d for d in target.parents if d != PurePosixPath(".")]

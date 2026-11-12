@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
-import voyageai
 from dotenv import find_dotenv, load_dotenv
 from rich.console import Console
 
@@ -159,6 +158,9 @@ async def _ensure_embeddings(
     missing: Sequence[str] | None = None,
 ) -> bool:
     """Embebe los hashes que faltan; False si es `dry_run` y no se embebió."""
+    # Import diferido, como en `VoyageEmbedder`: el modo estructural no lo carga.
+    import voyageai
+
     embedder: Embedder | None = None
 
     def get_embedder() -> Embedder:

@@ -234,7 +234,9 @@ def structural_pairs(
         by_hash[s.content_hash].append(i)
     for i in eligible:
         by_norm[snippets[i].norm_hash].append(i)
-    index = _ShingleIndex(snippets, eligible) if eligible else None
+    # Armar el índice cuesta ~0.1 s en un repo grande: solo si alguna consulta lo usa.
+    use_index = any(q in eligible_set for q in queries)
+    index = _ShingleIndex(snippets, eligible) if use_index else None
     m = _normalize(matrix.astype(np.float32)) if matrix is not None else None
 
     found: dict[tuple[int, int], Pair] = {}

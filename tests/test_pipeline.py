@@ -2,7 +2,7 @@ import asyncio
 
 from conftest import count_extractions
 
-from semantic_spotter import gitsource, pipeline
+from semantic_spotter import gitsource, pipeline, store
 from semantic_spotter.pipeline import (
     EmbeddingPlan,
     ExtractOptions,
@@ -84,6 +84,17 @@ async def test_db_does_not_store_text(make_repo, fake_embedder):
         assert "text" not in schema.names, name
     # El texto embebido se recuperó del blob y coincide con lo que hashea el extractor.
     assert fake_embedder.embedded[0].startswith("func Sum(xs []int) int {")
+
+
+async def test_many_blobs_load_the_same_snippets(make_repo, fake_embedder, monkeypatch):
+    files = {f"p{i}/a.go": GO_A.replace("Sum", f"Sum{i}") for i in range(3)}
+    repo, sha = make_repo(files | {"gen.go": GO_GEN})
+    _, snippets = await _scan(repo, sha, fake_embedder)
+    # Con más valores que un lote, la lectura filtra en arrow en vez de usar `IN (...)`.
+    monkeypatch.setattr(store, "_IN_CHUNK", 1)
+    _, again = await _scan(repo, sha, fake_embedder)
+    assert again == snippets
+    assert {s.file_path for s in again} == set(files)
 
 
 async def test_new_extract_version_reextracts_without_reembedding(

@@ -15,6 +15,7 @@ from typing import Any, Self
 import lancedb
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 from lancedb.db import AsyncConnection
 from lancedb.table import AsyncTable
 
@@ -307,6 +308,27 @@ class Store:
             query = query.select(list(columns))
         return (await query.to_arrow()).to_pylist()
 
+    async def _rows_in(
+        self,
+        table: AsyncTable,
+        where: str,
+        column: str,
+        values: Iterable[str],
+        columns: Sequence[str],
+    ) -> list[dict[str, Any]]:
+        """Filas de `where` con `column` en `values`.
+
+        Con más de un lote de valores, varios `IN (...)` de mil literales tardan
+        mucho más que leer la tabla una vez y filtrar en arrow.
+        """
+        wanted = sorted(set(values))
+        if not wanted:
+            return []
+        if len(wanted) <= _IN_CHUNK:
+            return await self._rows(table, f"{where} AND {_in(column, wanted)}", columns)
+        data = await table.query().where(where).select(list(columns)).to_arrow()
+        return data.filter(pc.is_in(data[column], value_set=pa.array(wanted))).to_pylist()
+
     # --- árboles --------------------------------------------------------------
 
     @staticmethod
@@ -420,19 +442,17 @@ class Store:
     async def _load_contents(
         self, hashes: Iterable[str], normalizer: str
     ) -> dict[str, tuple[str, tuple[int, ...], int]]:
-        out: dict[str, tuple[str, tuple[int, ...], int]] = {}
-        norm = f"normalizer = {_sql_str(normalizer)}"
-        for chunk in _chunks(sorted(set(hashes))):
-            rows = await self._rows(
-                self._contents,
-                f"{norm} AND {_in('content_hash', chunk)}",
-                ["content_hash", "norm_hash", "shingles", "token_count"],
-            )
-            out.update(
-                (r["content_hash"], (r["norm_hash"], tuple(r["shingles"]), r["token_count"]))
-                for r in rows
-            )
-        return out
+        rows = await self._rows_in(
+            self._contents,
+            f"normalizer = {_sql_str(normalizer)}",
+            "content_hash",
+            hashes,
+            ["content_hash", "norm_hash", "shingles", "token_count"],
+        )
+        return {
+            r["content_hash"]: (r["norm_hash"], tuple(r["shingles"]), r["token_count"])
+            for r in rows
+        }
 
     async def load_snippets(
         self, files: Sequence[TreeFile], extract_key: str, normalizer: str
@@ -440,14 +460,15 @@ class Store:
         """Snippets de los archivos dados (ya extraídos), unidos con su huella."""
         key = f"extract_key = {_sql_str(extract_key)}"
         by_blob: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-        for chunk in _chunks(sorted({f.blob_oid for f in files})):
-            rows = await self._rows(
-                self._blob_snippets,
-                f"{key} AND {_in('blob_oid', chunk)}",
-                [*_LOCATION_FIELDS, "language"],
-            )
-            for r in rows:
-                by_blob[(r["blob_oid"], r["language"])].append(r)
+        rows = await self._rows_in(
+            self._blob_snippets,
+            key,
+            "blob_oid",
+            (f.blob_oid for f in files),
+            [*_LOCATION_FIELDS, "language"],
+        )
+        for r in rows:
+            by_blob[(r["blob_oid"], r["language"])].append(r)
         contents = await self._load_contents(
             (r["content_hash"] for rows in by_blob.values() for r in rows), normalizer
         )
