@@ -9,18 +9,29 @@ from semantic_spotter.models import Snippet, Unit
 
 SHINGLE_SIZE = 5
 
-# `// semantic-spotter:ignore -- <motivo>` (o `/* … */`); sin motivo no cuenta.
-_IGNORE_MARK = re.compile(
-    r"^(?://|/\*)\s*semantic-spotter:ignore\s+--\s*(?P<reason>.*?)\s*(?:\*/)?\s*$", re.DOTALL
-)
+# `semantic-spotter:ignore -- <motivo>` en el cuerpo de un comentario; sin motivo no cuenta.
+_IGNORE_MARK = re.compile(r"^semantic-spotter:ignore\s+--\s*(?P<reason>.*?)\s*$")
+
+
+def _comment_body(text: str) -> str:
+    """Texto de un comentario sin `//`, `/*`, `/**` ni `*/`, y sin el ` * ` de cada línea."""
+    text = text.strip()
+    if text.startswith("//"):
+        return text[2:].strip()
+    lines = (
+        line.strip().removeprefix("*").strip()
+        for line in text.removeprefix("/*").removesuffix("*/").splitlines()
+    )
+    return " ".join(line for line in lines if line)
 
 
 def ignore_reason(node: Node) -> str:
-    """Motivo de la marca de ignorar del comentario inmediatamente anterior al nodo.
+    """Motivo de la marca de ignorar del bloque de comentarios inmediatamente anterior al nodo.
 
-    El comentario es hermano de la declaración que empieza en la misma línea que
-    el nodo (`export function`, `const f = () =>`), queda fuera de su rango de
-    bytes y no puede tener líneas ni código entre medio. "" si no hay marca válida.
+    Los comentarios son hermanos de la declaración que empieza en la misma línea
+    que el nodo (`export function`, `const f = () =>`), quedan fuera de su rango
+    de bytes y no pueden tener líneas ni código entre medio. La marca puede ir
+    en cualquiera de ellos (p. ej. encima del doc comment). "" si no hay marca válida.
     """
     anchor = node
     while (
@@ -29,20 +40,21 @@ def ignore_reason(node: Node) -> str:
         and anchor.parent.start_point.row == anchor.start_point.row
     ):
         anchor = anchor.parent
-    comment = anchor.prev_sibling
-    if (
-        comment is None
-        or comment.type != "comment"
-        or anchor.start_point.row - comment.end_point.row > 1
-    ):
-        return ""
-    # Un comentario al final de una línea de código no marca la línea siguiente.
-    before = comment.prev_sibling
-    if before is not None and before.end_point.row == comment.start_point.row:
-        return ""
-    text = (comment.text or b"").decode("utf-8", "replace")
-    match = _IGNORE_MARK.match(text)
-    return match["reason"] if match else ""
+    comment, row = anchor.prev_sibling, anchor.start_point.row
+    while comment is not None and comment.type == "comment" and row - comment.end_point.row <= 1:
+        before = comment.prev_sibling
+        # Un comentario al final de una línea de código no marca la línea siguiente.
+        if (
+            before is not None
+            and before.type != "comment"
+            and before.end_point.row == comment.start_point.row
+        ):
+            return ""
+        match = _IGNORE_MARK.match(_comment_body((comment.text or b"").decode("utf-8", "replace")))
+        if match and match["reason"]:
+            return match["reason"]
+        comment, row = before, comment.start_point.row
+    return ""
 
 
 def snippet_text(source: bytes, start_byte: int, end_byte: int) -> str:

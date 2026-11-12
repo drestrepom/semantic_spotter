@@ -483,6 +483,49 @@ def test_check_mark_in_typescript(check_repo, make_repo, marked):
     assert result.exit_code == (0 if marked else 1), result.output
 
 
+@pytest.mark.parametrize(
+    "mark",
+    [
+        "/** semantic-spotter:ignore -- variantes por tipo de orden */\n",
+        "/*\n * semantic-spotter:ignore -- variantes por tipo\n * de orden\n */\n",
+    ],
+    ids=["jsdoc", "bloque-multilinea"],
+)
+def test_check_mark_in_block_comment(check_repo, make_repo, mark):
+    signature = "(orders: Order[], limit: number): string[]"
+    make_repo(
+        {
+            "t/a.ts": f"{mark}export function pendingIds{signature} {{{TS_BODY}}}\n",
+            "t/b.ts": f"{mark}export function shippedIds{signature} {{{TS_BODY}}}\n",
+        }
+    )
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize(
+    "comments",
+    [
+        # La marca sobre el doc comment de Go.
+        "// semantic-spotter:ignore -- adaptador temporal\n// ShippedIDs filtra por estado.\n",
+        "/* semantic-spotter:ignore -- adaptador temporal */ /* otro */\n",
+    ],
+    ids=["sobre-doc-comment", "seguida-de-otro"],
+)
+def test_check_mark_followed_by_other_comments(check_repo, make_repo, comments):
+    copy = LONG.format(pkg="b", name="ShippedIDs", status="shipped")
+    make_repo({"b/b.go": copy.replace("\nfunc ", f"\n{comments}func ")})
+    result = _check(check_repo, "--structural")
+    assert result.exit_code == 0, result.output
+
+
+def test_check_trailing_mark_on_code_line_does_not_count(check_repo, make_repo):
+    copy = LONG.format(pkg="b", name="ShippedIDs", status="shipped")
+    trailing = "var x = 1 // semantic-spotter:ignore -- no es de la función\n// Doc.\n"
+    make_repo({"b/b.go": copy.replace("\nfunc ", f"\n{trailing}func ")})
+    assert _check(check_repo, "--structural").exit_code == 1
+
+
 def test_check_same_blob_as_ts_and_tsx(check_repo, make_repo):
     source = f"export function pendingIds(orders: Order[], limit: number): string[] {{{TS_BODY}}}\n"
     make_repo({"t/a.ts": source})
