@@ -490,6 +490,17 @@ async def test_check_gives_up_on_held_lock(check_repo, monkeypatch):
     assert "sigue bloqueado" in stderr
 
 
+async def test_warm_check_does_not_wait_for_lock(check_repo, make_repo, monkeypatch):
+    make_repo({"b/b.go": LONG.format(pkg="b", name="ShippedIDs", status="shipped")})
+    assert (await asyncio.to_thread(_check, check_repo, "--structural")).exit_code == 1
+    monkeypatch.setattr(store, "_LOCK_TIMEOUT_SECONDS", 0.5)
+    other = await Store.open(check_repo, cli.DEFAULT_MODEL, cli.DIM)
+    # Con el índice caliente no hay nada que escribir: no espera a otro worktree.
+    async with other.writing():
+        result = await asyncio.to_thread(_check, check_repo, "--structural")
+    assert result.exit_code == 1, result.output
+
+
 def test_parallel_checks_share_index(check_repo, make_repo):
     # Varios archivos para que las dos corridas compitan por las mismas escrituras.
     make_repo(

@@ -36,10 +36,6 @@ _LOCK_TIMEOUT_SECONDS = 60.0
 # El sufijo cambia cuando cambia el esquema; las tablas viejas quedan sin uso.
 _SUFFIX = "_v4"
 
-# commit → árbol: registra que el commit se analizó.
-_COMMITS_SCHEMA = pa.schema(
-    [pa.field("commit_sha", pa.string()), pa.field("tree_oid", pa.string())]
-)
 # Marca que un árbol quedó registrado completo en `tree_files`.
 _TREES_SCHEMA = pa.schema(
     [pa.field("tree_oid", pa.string()), pa.field("file_count", pa.int64())]
@@ -193,7 +189,6 @@ async def index_dir(repo_root: Path) -> Path:
 class Store:
     """Índice compartido por los worktrees del repo (ver `index_dir`).
 
-    - `commits`: commit → árbol, para los commits analizados.
     - `trees` + `tree_files`: (ruta, blob) de cada árbol registrado.
     - `blobs` + `blob_snippets`: snippets de cada blob por config de extracción;
       un blob se extrae una sola vez aunque aparezca en muchos commits.
@@ -214,7 +209,6 @@ class Store:
         self._db = db
         self._lock_path = lock_path
         self._on_lock_wait = on_lock_wait
-        self._commits = tables["commits"]
         self._trees = tables["trees"]
         self._tree_files = tables["tree_files"]
         self._blobs = tables["blobs"]
@@ -246,7 +240,6 @@ class Store:
             ]
         )
         schemas = {
-            "commits" + _SUFFIX: _COMMITS_SCHEMA,
             "trees" + _SUFFIX: _TREES_SCHEMA,
             "tree_files" + _SUFFIX: _TREE_FILES_SCHEMA,
             "blobs" + _SUFFIX: _BLOBS_SCHEMA,
@@ -257,12 +250,21 @@ class Store:
             "embeddings__" + re.sub(r"\W", "_", model) + f"__{dim}": embeddings_schema,
         }
         lock_path = path / _LOCK_FILENAME
-        tables = {}
-        # Crear las tablas también es escribir: dos primeras corridas a la vez no chocan.
-        async with _flock(lock_path, on_lock_wait):
-            for name, schema in schemas.items():
-                key = name.removesuffix(_SUFFIX) if name.endswith(_SUFFIX) else "embeddings"
-                tables[key] = await db.create_table(name, schema=schema, exist_ok=True)
+        existing = {name async for name in db.list_tables()}
+        if existing.issuperset(schemas):
+            # Índice ya creado: abrirlo es solo leer, no espera a quien esté escribiendo.
+            opened = {name: await db.open_table(name) for name in schemas}
+        else:
+            # Crear las tablas también es escribir: dos primeras corridas a la vez no chocan.
+            async with _flock(lock_path, on_lock_wait):
+                opened = {
+                    name: await db.create_table(name, schema=schema, exist_ok=True)
+                    for name, schema in schemas.items()
+                }
+        tables = {
+            name.removesuffix(_SUFFIX) if name.endswith(_SUFFIX) else "embeddings": table
+            for name, table in opened.items()
+        }
         return cls(db, tables, dim, lock_path, on_lock_wait)
 
     @asynccontextmanager
@@ -285,16 +287,7 @@ class Store:
             query = query.select(list(columns))
         return (await query.to_arrow()).to_pylist()
 
-    # --- commits y árboles ----------------------------------------------------
-
-    async def link_commit(self, sha: str, tree_oid: str) -> None:
-        if await self._commits.count_rows(f"commit_sha = {_sql_str(sha)}"):
-            return
-        await self._commits.add(
-            pa.Table.from_pylist(
-                [{"commit_sha": sha, "tree_oid": tree_oid}], schema=_COMMITS_SCHEMA
-            )
-        )
+    # --- árboles --------------------------------------------------------------
 
     async def has_tree(self, tree_oid: str) -> bool:
         return await self._trees.count_rows(f"tree_oid = {_sql_str(tree_oid)}") > 0

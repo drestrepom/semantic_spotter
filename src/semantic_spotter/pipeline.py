@@ -98,11 +98,8 @@ async def index_tree(
 async def index_commit(
     store: Store, repo: Path, sha: str, options: ExtractOptions
 ) -> list[Snippet]:
-    """Registra que el commit se analizó y devuelve los snippets de su árbol."""
-    tree_oid = await gitsource.tree_of(repo, sha)
-    async with store.writing():
-        await store.link_commit(sha, tree_oid)
-    return await index_tree(store, repo, tree_oid, options)
+    """Snippets del árbol del commit."""
+    return await index_tree(store, repo, await gitsource.tree_of(repo, sha), options)
 
 
 # Commits por lote al recorrer el historial: cada lote lee sus blobs con un solo

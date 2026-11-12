@@ -448,9 +448,6 @@ async def _check(
     head_label = "index" if staged else head_sha[:12]
     with err.status(f"Extrayendo snippets de {base_sha[:12]} y {head_label}…"):
         base_snippets = await index_commit(store, repo, base_sha, options)
-        if not staged:
-            async with store.writing():
-                await store.link_commit(head_sha, head_tree)
         head_snippets = await index_tree(store, repo, head_tree, options)
     path_filter = await load_path_filter(repo, head_tree, exclude)
     base_snippets = apply_path_filter(base_snippets, path_filter)
