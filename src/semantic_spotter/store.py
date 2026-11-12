@@ -125,6 +125,13 @@ def _chunks(values: Iterable[str]) -> Iterable[list[str]]:
     return (list(c) for c in itertools.batched(values, _IN_CHUNK))
 
 
+def _narrowed(where: str, column: str, values: Iterable[str] | None) -> list[str]:
+    """`where` solo, o `where AND column IN (...)` por cada tanda de `values`."""
+    if values is None:
+        return [where]
+    return [f"{where} AND {_in(column, c)}" for c in _chunks(sorted(set(values)))]
+
+
 class IndexBusy(RuntimeError):
     """Otro proceso retuvo el lock del índice más de `_LOCK_TIMEOUT_SECONDS`."""
 
@@ -432,23 +439,31 @@ class Store:
 
     # --- historial ------------------------------------------------------------
 
-    async def walked_commits(self, extract_key: str) -> set[str]:
-        rows = await self._rows(
-            self._history, f"extract_key = {_sql_str(extract_key)}", ["commit_sha"]
-        )
-        return {r["commit_sha"] for r in rows}
+    async def walked_commits(
+        self, extract_key: str, shas: Iterable[str] | None = None
+    ) -> set[str]:
+        """Commits ya recorridos con esta config (de entre `shas`, si se da)."""
+        walked: set[str] = set()
+        key = f"extract_key = {_sql_str(extract_key)}"
+        for where in _narrowed(key, "commit_sha", shas):
+            rows = await self._rows(self._history, where, ["commit_sha"])
+            walked.update(r["commit_sha"] for r in rows)
+        return walked
 
-    async def seen_at(self, extract_key: str) -> dict[tuple[str, str], int]:
-        """Fecha del avistamiento más antiguo conocido de cada (ruta, contenido)."""
-        rows = await self._rows(
-            self._first_seen,
-            f"extract_key = {_sql_str(extract_key)}",
-            ["path", "content_hash", "committed_at"],
-        )
-        out: dict[tuple[str, str], int] = {}
-        for r in rows:
-            k = (r["path"], r["content_hash"])
-            out[k] = min(out.get(k, r["committed_at"]), r["committed_at"])
+    async def sightings(
+        self, extract_key: str, hashes: Iterable[str] | None = None
+    ) -> dict[tuple[str, str], Sighting]:
+        """Avistamiento más antiguo conocido de cada (ruta, contenido) (de entre `hashes`)."""
+        key = f"extract_key = {_sql_str(extract_key)}"
+        out: dict[tuple[str, str], Sighting] = {}
+        for where in _narrowed(key, "content_hash", hashes):
+            rows = await self._rows(
+                self._first_seen, where, ["path", "content_hash", "commit_sha", "committed_at"]
+            )
+            for r in rows:
+                k = (r["path"], r["content_hash"])
+                if k not in out or r["committed_at"] < out[k].committed_at:
+                    out[k] = Sighting(**r)
         return out
 
     async def save_history(
@@ -456,9 +471,19 @@ class Store:
         extract_key: str,
         commits: Sequence[tuple[str, int]],
         sightings: Sequence[Sighting],
-    ) -> None:
-        """Las marcas de commits van al final: un corte deja commits por recorrer, no huecos."""
-        if sightings:
+    ) -> int:
+        """Guarda lo que otro proceso no guardó ya; devuelve cuántos avistamientos agregó.
+
+        Las marcas de commits van al final: un corte deja commits por recorrer, no huecos.
+        """
+        known = await self.sightings(extract_key, {x.content_hash for x in sightings})
+        new: dict[tuple[str, str], Sighting] = {}
+        for x in sightings:
+            k = (x.path, x.content_hash)
+            current = new.get(k) or known.get(k)
+            if current is None or x.committed_at < current.committed_at:
+                new[k] = x
+        if new:
             rows = [
                 {
                     "path": x.path,
@@ -467,34 +492,26 @@ class Store:
                     "commit_sha": x.commit_sha,
                     "committed_at": x.committed_at,
                 }
-                for x in sightings
+                for x in new.values()
             ]
             await self._first_seen.add(pa.Table.from_pylist(rows, schema=_FIRST_SEEN_SCHEMA))
-        if commits:
-            rows = [
-                {"commit_sha": sha, "extract_key": extract_key, "committed_at": ts}
-                for sha, ts in commits
-            ]
+        walked = await self.walked_commits(extract_key, (sha for sha, _ in commits))
+        rows = [
+            {"commit_sha": sha, "extract_key": extract_key, "committed_at": ts}
+            for sha, ts in commits
+            if sha not in walked
+        ]
+        if rows:
             await self._history.add(pa.Table.from_pylist(rows, schema=_HISTORY_SCHEMA))
+        return len(new)
 
     async def first_seen(
         self, snippets: Sequence[Snippet], extract_key: str
     ) -> dict[tuple[str, str], Sighting]:
         """Primer avistamiento conocido de cada (ruta, contenido) de los snippets dados."""
         wanted = {(s.file_path, s.content_hash) for s in snippets}
-        out: dict[tuple[str, str], Sighting] = {}
-        key = f"extract_key = {_sql_str(extract_key)}"
-        for chunk in _chunks(sorted({h for _, h in wanted})):
-            rows = await self._rows(
-                self._first_seen,
-                f"{key} AND {_in('content_hash', chunk)}",
-                ["path", "content_hash", "commit_sha", "committed_at"],
-            )
-            for r in rows:
-                k = (r["path"], r["content_hash"])
-                if k in wanted and (k not in out or r["committed_at"] < out[k].committed_at):
-                    out[k] = Sighting(**r)
-        return out
+        known = await self.sightings(extract_key, (h for _, h in wanted))
+        return {k: x for k, x in known.items() if k in wanted}
 
     # --- embeddings -----------------------------------------------------------
 

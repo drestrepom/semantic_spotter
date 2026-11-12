@@ -132,7 +132,7 @@ async def index_history(
     commits = await gitsource.history(repo, rev, since)
     walked = await store.walked_commits(options.key)
     todo = [c for c in commits if c.sha not in walked]
-    seen = await store.seen_at(options.key)
+    seen = {k: x.committed_at for k, x in (await store.sightings(options.key)).items()}
     hashes: dict[tuple[str, str], list[str]] = {}
     sightings_total = 0
     for start in range(0, len(todo), _HISTORY_BATCH):
@@ -173,10 +173,9 @@ async def index_history(
                         seen[(f.path, h)] = c.committed_at
                         sightings.append(Sighting(f.path, h, c.sha, c.committed_at))
         async with store.writing():
-            await store.save_history(
+            sightings_total += await store.save_history(
                 options.key, [(c.sha, c.committed_at) for c in batch], sightings
             )
-        sightings_total += len(sightings)
         if on_batch is not None:
             on_batch(start + len(batch), len(todo))
     return HistoryStats(len(commits), len(todo), len(hashes), sightings_total)
