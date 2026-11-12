@@ -438,11 +438,18 @@ class Store:
         )
         return {r["commit_sha"] for r in rows}
 
-    async def seen_keys(self, extract_key: str) -> set[tuple[str, str]]:
+    async def seen_at(self, extract_key: str) -> dict[tuple[str, str], int]:
+        """Fecha del avistamiento más antiguo conocido de cada (ruta, contenido)."""
         rows = await self._rows(
-            self._first_seen, f"extract_key = {_sql_str(extract_key)}", ["path", "content_hash"]
+            self._first_seen,
+            f"extract_key = {_sql_str(extract_key)}",
+            ["path", "content_hash", "committed_at"],
         )
-        return {(r["path"], r["content_hash"]) for r in rows}
+        out: dict[tuple[str, str], int] = {}
+        for r in rows:
+            k = (r["path"], r["content_hash"])
+            out[k] = min(out.get(k, r["committed_at"]), r["committed_at"])
+        return out
 
     async def save_history(
         self,

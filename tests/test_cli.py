@@ -274,6 +274,21 @@ def test_index_then_check_shows_first_seen(check_repo, make_repo):
     assert first_seen["b/b.go"] is None  # el commit nuevo todavía no se recorrió
 
 
+def test_index_since_then_full_keeps_oldest_sighting(check_repo, make_repo, monkeypatch):
+    original = git(check_repo, "rev-parse", "HEAD")
+    # Otro commit, un día después, toca a/a.go sin cambiar la función: también la avista.
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2030-01-02T00:00:00")
+    make_repo({"a/a.go": LONG.format(pkg="a", name="PendingIDs", status="pending") + "\n// cola\n"})
+    for args in (["--since", original], []):
+        result = CliRunner().invoke(cli.app, ["index", str(check_repo), *args])
+        assert result.exit_code == 0, result.output
+
+    make_repo({"b/b.go": LONG.format(pkg="b", name="ShippedIDs", status="shipped")})
+    [group] = json.loads(_check(check_repo, "--structural").stdout)
+    first_seen = {m["file_path"]: m["first_seen"] for m in group["members"]}
+    assert first_seen["a/a.go"]["commit"] == original
+
+
 # --- marca de ignorar ------------------------------------------------------------
 
 

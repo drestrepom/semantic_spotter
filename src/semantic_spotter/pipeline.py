@@ -132,7 +132,7 @@ async def index_history(
     commits = await gitsource.history(repo, rev, since)
     walked = await store.walked_commits(options.key)
     todo = [c for c in commits if c.sha not in walked]
-    seen = await store.seen_keys(options.key)
+    seen = await store.seen_at(options.key)
     hashes: dict[tuple[str, str], list[str]] = {}
     sightings_total = 0
     for start in range(0, len(todo), _HISTORY_BATCH):
@@ -166,8 +166,11 @@ async def index_history(
             for f in c.changed:
                 spec = spec_for(f.path)
                 for h in hashes.get((f.oid, spec.name), []) if spec else []:
-                    if (f.path, h) not in seen:
-                        seen.add((f.path, h))
+                    # Un commit más antiguo puede recorrerse después (`--since` y luego
+                    # todo, o ramas paralelas): su avistamiento reemplaza al conocido.
+                    known = seen.get((f.path, h))
+                    if known is None or c.committed_at < known:
+                        seen[(f.path, h)] = c.committed_at
                         sightings.append(Sighting(f.path, h, c.sha, c.committed_at))
         async with store.writing():
             await store.save_history(
