@@ -7,7 +7,8 @@ _NOISE_DIRS = frozenset({"vendor", "node_modules"})
 _GENERATED_SUFFIXES = (".d.ts", ".pb.go")
 _TEST_PATTERNS = re.compile(r"(_test\.go|\.(test|spec)\.[cm]?tsx?)$")
 # Convención de Go (y de muchos generadores TS): https://go.dev/s/generatedcode
-_GENERATED_HEADER = re.compile(rb"^// Code generated .* DO NOT EDIT\.$", re.MULTILINE)
+# `\r?` porque con MULTILINE `$` no acepta el fin de línea CRLF.
+_GENERATED_HEADER = re.compile(rb"^// Code generated .* DO NOT EDIT\.\r?$", re.MULTILINE)
 
 
 class GitError(RuntimeError):
