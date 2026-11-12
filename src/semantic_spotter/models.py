@@ -35,6 +35,8 @@ class Snippet:
     norm_hash: str = ""
     # hashes de k-gramas de tokens normalizados, para Jaccard (T3)
     shingles: tuple[int, ...] = ()
+    # motivo de la marca de ignorar efectiva (propia o del contenedor); "" sin marca
+    ignore_reason: str = ""
 
     @property
     def location(self) -> str:
